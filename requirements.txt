@@ -1,0 +1,9 @@
+# Windows x64 / CPython 3.12. Keep R73 for the bundled TensorRT plug-in.
+VapourSynth==73
+numpy==2.5.5
+onnx==1.23.2
+onnxconverter-common==1.16.0
+ml-dtypes==0.7.0
+packaging==26.3
+protobuf==7.36.2
+typing-extensions==4.16.0

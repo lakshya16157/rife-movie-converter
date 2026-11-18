@@ -1,0 +1,10 @@
+/runtime/
+__pycache__/
+*.py[cod]
+*.mkv
+*.mp4
+*.mov
+*.avi
+*.webm
+*.zip
+*.7z
