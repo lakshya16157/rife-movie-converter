@@ -2,6 +2,8 @@
 
 A Windows desktop app for generating intermediate video frames with RIFE 4.25 on an NVIDIA GPU. It exports a 10-bit HEVC MKV, copies audio and subtitles, and can play the growing export in mpv.
 
+This RTX 3090 build defaults to source resolution, 2× interpolation, and both cleanup filters off. See the [RTX 3090 benchmark results](RTX-3090-benchmarks.md) for the tested settings and quality comparison.
+
 1. Install [64-bit Python 3.12](https://www.python.org/downloads/release/python-31210/), [7-Zip](https://www.7-zip.org/), and a current NVIDIA driver.
 2. Clone or download this repository. Run **Set Up RIFE.cmd** once to download the model, FFmpeg, mpv and the GPU runtime.
 3. Open **Open RIFE Movie Converter.cmd**, choose a movie, and try **Export first 30 sec**.

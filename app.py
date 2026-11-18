@@ -18,7 +18,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 ROOT = Path(__file__).resolve().parent
-RUNTIME = ROOT / "runtime"
+RUNTIME = (ROOT / "runtime").resolve()
 FFMPEG = RUNTIME / "probe" / "ffmpeg.exe"
 FFPROBE = FFMPEG.with_name("ffprobe.exe")
 PYTHON = RUNTIME / "work-python" / "Scripts" / "python.exe"
@@ -330,7 +330,7 @@ class Export:
                     "-map", "0:v:0", "-map", "1:a?", "-map", "1:s?", "-map", "1:t?",
                     "-map_metadata", "1", "-map_chapters", "-1" if self.sample else "1",
                     "-c:a", "copy", "-c:s", "copy", "-c:t", "copy", "-c:v", "hevc_nvenc", "-profile:v", "main10", "-pix_fmt", "p010le",
-                    "-preset", "p7", "-tune", "hq", "-multipass", "fullres", "-spatial-aq", "1", "-temporal-aq", "1",
+                    "-preset", "p5", "-tune", "hq", "-multipass", "disabled", "-spatial-aq", "1", "-temporal-aq", "1",
                     "-rc-lookahead", "32", *self.split_encode(), "-rc", "vbr", "-b:v", f"{self.bitrate}M",
                     "-maxrate", f"{self.bitrate * 2}M", "-bufsize", f"{self.bitrate * 2}M",
                     "-g", str(round(self.target * 2)), "-color_range", "pc" if full else "tv"]
@@ -416,7 +416,7 @@ class Export:
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("RIFE Movie Converter")
+        self.title("RIFE Movie Converter — RTX 3090")
         self.geometry("1010x900")
         self.minsize(1000, 880)
         self.source = None
