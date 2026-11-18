@@ -9,6 +9,29 @@ RUNTIME = (Path(__file__).resolve().parent / "runtime").resolve()
 PLUGINS = RUNTIME / "plugins"
 
 
+def protect_lite_frames(result, original, ratio):
+    import vapoursynth as vs
+
+    # A failed Lite frame can contain patches of zeroed Y, U and V samples.
+    # Sample a small grid so checking for those patches does not copy the 4K frame.
+    sample = result.resize.Point(width=128, height=72)
+    planes = [sample.std.ShufflePlanes(planes=plane, colorfamily=vs.GRAY) for plane in range(3)]
+    planes[0] = planes[0].resize.Point(width=64, height=36)
+    invalid = vs.core.std.Expr(planes, expr="x 8 <= y 8 <= and z 8 <= and 1023 0 ?")
+    scores = invalid.std.PlaneStats()
+
+    def select(n, f):
+        tick = n * ratio.denominator
+        if tick % ratio.numerator and f.props["PlaneStatsAverage"] >= 0.01:
+            source_index = min(tick // ratio.numerator, original.num_frames - 1)
+            print(f"RIFE Lite output frame {n} has zeroed color samples. Using source frame {source_index}.",
+                  file=sys.stderr, flush=True)
+            return original[source_index]
+        return result
+
+    return result.std.FrameEval(select, prop_src=scores, clip_src=[result, original])
+
+
 def frames(job):
     import vapoursynth as vs
 
@@ -115,6 +138,8 @@ def frames(job):
                   backend=trt(half_io=matrix == "709"), _implementation=2)
     result = result.std.Crop(right=pad_w, bottom=pad_h)
     result = result.resize.Bicubic(format=vs.YUV420P10, matrix_s=matrix, range_s=range_in, chromaloc_s=chroma)
+    if lite_model:
+        result = protect_lite_frames(result, original, ratio)
     if ratio.denominator == 1:
         # Preserve the resized original frames at each integer source timestamp.
         step = int(ratio)

@@ -16,6 +16,8 @@
 
 After setup, conversion and playback run offline. To reinstall after moving the folder to another PC, rename `runtime/work-python` and run setup there. Each PC builds its own TensorRT engines.
 
+On an existing installation, run **Set Up RIFE.cmd** once after updating to install the portable VapourSynth R73 host beside FFmpeg. Reopen the app. The export log shows `Frame transport: embedded VapourSynth` when FFmpeg can load it. Older runtimes automatically use the existing Y4M pipe.
+
 ## Where the files go
 
 - **runtime** holds the model, local dependencies, caches, and logs. A fresh clone creates that folder during setup. It is excluded from Git.

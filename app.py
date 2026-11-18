@@ -8,11 +8,13 @@ import os
 import queue
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import tkinter as tk
 import uuid
 from fractions import Fraction
+from functools import cache, lru_cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -117,12 +119,38 @@ def best_encoder(gpu):
     return list(ENCODERS)[saved[gpu]]
 
 
+@cache
+def embedded_python():
+    """Check the local FFmpeg/Python combination once. Older installs use the pipe."""
+    if not FFMPEG.with_name("portable.vs").is_file():
+        return {}
+    settings = dict(PYTHONHOME=sys.base_prefix, PYTHONPATH=str(PYTHON.parent.parent / "Lib/site-packages"),
+                    PYTHONNOUSERSITE="1")
+    script = b"import vapoursynth as vs\nvs.core.std.BlankClip(length=1).set_output()\n"
+    try:
+        probe = subprocess.run([FFMPEG, "-v", "error", "-f", "vapoursynth", "-i", "pipe:0", "-f", "null", "-"],
+                               input=script, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               env=dict(os.environ, **settings), timeout=10, **HIDDEN)
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    return settings if probe.returncode == 0 else {}
+
+
 def timecode(seconds):
     seconds = max(0, int(seconds))
     return f"{seconds // 3600:02d}:{seconds // 60 % 60:02d}:{seconds % 60:02d}"
 
 
 def probe_movie(path):
+    path = Path(path).resolve()
+    stat = path.stat()
+    identity = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+    video, rate, duration = _probe_movie(path, identity)
+    return video.copy(), rate, duration
+
+
+@lru_cache(maxsize=16)
+def _probe_movie(path, _identity):
     result = subprocess.run(
         [FFPROBE, "-v", "error", "-show_format", "-show_streams", "-of", "json", path],
         **HIDDEN, capture_output=True, encoding="utf-8", errors="replace", check=True,
@@ -142,8 +170,21 @@ def probe_movie(path):
     container_start = data["format"].get("start_time", "0")
     video["offset"] = float(start if start != "N/A" else 0) - float(
         container_start if container_start != "N/A" else 0)
+    stream_types = {stream.get("codec_type") for stream in data["streams"]}
+    video["split_track_inputs"] = {"audio", "subtitle"} <= stream_types
     inspect_color(path, video, duration)
     return video, rate, duration
+
+
+@lru_cache(maxsize=32)
+def supports_split_encode(ffmpeg, size):
+    # The app uses FFmpeg's default GPU. Recheck when its process or encoder resolution changes.
+    probe = subprocess.run(
+        [ffmpeg, "-v", "error", "-f", "lavfi", "-i", "color=s={}x{}".format(*size), "-frames:v", "1",
+         "-c:v", "hevc_nvenc", "-profile:v", "main10", "-pix_fmt", "p010le",
+         "-split_encode_mode", "forced", "-f", "null", "-"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **HIDDEN)
+    return probe.returncode == 0
 
 
 def inspect_color(path, video, duration):
@@ -280,9 +321,11 @@ class Export:
         self.encoder = None
 
     def cancel_render(self):
+        if self.cancel.is_set():
+            return
         self.cancel.set()
-        if self.encoder and self.encoder.poll() is None:
-            self.encoder.terminate()
+        if self.encoder:
+            threading.Thread(target=self.stop_worker, args=(self.encoder,), daemon=True).start()
 
     def sample_gpu(self, monitor):
         for line in monitor.stdout:
@@ -315,16 +358,6 @@ class Export:
             encoder_load=round(sum(encoder) / len(encoder)), vram=round(max(memory) / 1024, 1),
         )
 
-    def split_encode(self):
-        # Two-chip NVENC cards encode 4K almost twice as fast in strips. Probe one frame so cards or
-        # frame sizes that reject the mode keep the plain single-chip path.
-        option = ["-split_encode_mode", "forced"]
-        probe = subprocess.run(
-            [FFMPEG, "-v", "error", "-f", "lavfi", "-i", "color=s={}x{}".format(*self.size), "-frames:v", "1",
-             "-c:v", "hevc_nvenc", "-profile:v", "main10", "-pix_fmt", "p010le", *option, "-f", "null", "-"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **HIDDEN)
-        return [] if probe.returncode else option
-
     def stop_worker(self, worker):
         if worker and worker.poll() is None:
             subprocess.run(["taskkill", "/PID", str(worker.pid), "/T", "/F"],
@@ -332,6 +365,7 @@ class Export:
             worker.wait()
 
     def run(self):
+        started = time.monotonic()
         worker = None
         monitor = counters = None
         lock = None
@@ -372,18 +406,24 @@ class Export:
             track_input = ["-i", self.source]
             if self.sample:
                 track_input = ["-t", str(self.duration), *track_input]
+            # Sparse subtitles can pull a shared input far ahead of its copied audio.
+            subtitle_input = 2 if self.video.get("split_track_inputs", True) else 1
+            source_inputs = track_input * subtitle_input
+            split_encode = ["-split_encode_mode", "forced"] if supports_split_encode(FFMPEG, self.size) else []
+            embedded = embedded_python()
+            # FFmpeg can otherwise exit successfully after a frame request fails mid-stream.
+            video_input = ["-xerror", "-f", "vapoursynth", "-i", ROOT / "export.vpy"] if embedded else [
+                "-f", "yuv4mpegpipe", "-i", "pipe:0"]
             args = [FFMPEG, "-hide_banner", "-loglevel", "warning", "-nostdin", "-n",
                     "-progress", "pipe:1", "-stats_period", "1",
-                    "-itsoffset", str(self.video["offset"]), *input_tags, "-f", "yuv4mpegpipe", "-i", "pipe:0",
-                    # Open the source twice. Sparse subtitle tracks keep their input reading far ahead, and
-                    # audio from that same input was written minutes before its video, which stalls VLC.
-                    *track_input, *track_input,
-                    "-map", "0:v:0", "-map", "1:a?", "-map", "2:s?", "-map", "2:t?",
+                    "-itsoffset", str(self.video["offset"]), *input_tags, *video_input,
+                    *source_inputs,
+                    "-map", "0:v:0", "-map", "1:a?", "-map", f"{subtitle_input}:s?", "-map", f"{subtitle_input}:t?",
                     "-map_metadata", "1", "-map_chapters", "-1" if self.sample else "1",
                     "-c:a", "copy", "-c:s", "copy", "-c:t", "copy", "-c:v", "hevc_nvenc", "-profile:v", "main10", "-pix_fmt", "p010le",
                     "-preset", self.preset, "-tune", "hq", "-multipass", self.multipass,
                     "-spatial-aq", "1", "-temporal-aq", "1",
-                    "-rc-lookahead", "32", *self.split_encode(), "-rc", "vbr", "-b:v", f"{self.bitrate}M",
+                    "-rc-lookahead", "32", *split_encode, "-rc", "vbr", "-b:v", f"{self.bitrate}M",
                     "-maxrate", f"{self.bitrate * 2}M", "-bufsize", f"{self.bitrate * 2}M",
                     "-g", str(round(self.target * 2)), "-color_range", "pc" if full else "tv"]
             tags = [f"range={'full' if full else 'limited'}", f"chroma_location={chroma}"]
@@ -399,16 +439,21 @@ class Export:
             args += ["-vf", ",".join(filters), "-chroma_sample_location", chroma]
             args += ["-flush_packets", "1", "-cluster_time_limit", "1000",
                      "-max_interleave_delta", "1000000", self.path]
-            env = dict(os.environ, PYTHONIOENCODING="utf-8")
+            env = dict(os.environ, PYTHONIOENCODING="utf-8", RIFE_JOB=str(self.config), **embedded)
             with self.log.open("wb") as log:
-                worker = subprocess.Popen([PYTHON, ROOT / "render.py", self.config],
-                                          stdout=subprocess.PIPE, stderr=log, env=env, **HIDDEN)
-                with subprocess.Popen(args, stdin=worker.stdout, stdout=subprocess.PIPE,
+                log.write(b"Frame transport: embedded VapourSynth\n" if embedded else b"Frame transport: Y4M pipe\n")
+                log.flush()
+                if not embedded:
+                    worker = subprocess.Popen([PYTHON, ROOT / "render.py", self.config],
+                                              stdout=subprocess.PIPE, stderr=log, env=env, **HIDDEN)
+                with subprocess.Popen(args, stdin=worker.stdout if worker else subprocess.DEVNULL,
+                                      env=env, stdout=subprocess.PIPE,
                                       stderr=log, encoding="utf-8", errors="replace", **HIDDEN) as encoder:
                     self.encoder = encoder
-                    worker.stdout.close()
+                    if worker:
+                        worker.stdout.close()
                     if self.cancel.is_set():
-                        encoder.terminate()
+                        self.stop_worker(encoder)
                     try:
                         monitor = subprocess.Popen(
                             [*GPU_QUERY, "--query-gpu=utilization.gpu,utilization.encoder,memory.used", "-l", "2"],
@@ -434,7 +479,10 @@ class Export:
                     encoded = encoder.wait()
                 if encoded or self.cancel.is_set():
                     self.stop_worker(worker)
-                produced = worker.wait()
+                produced = worker.wait() if worker else 0
+                if self.first:
+                    log.write(f"First encoded progress after {self.first[0] - started:.2f} s\n".encode("ascii"))
+                log.write(f"Export process elapsed {time.monotonic() - started:.2f} s\n".encode("ascii"))
             if self.cancel.is_set():
                 self.events.put(("cancelled", None))
             elif encoded or produced:

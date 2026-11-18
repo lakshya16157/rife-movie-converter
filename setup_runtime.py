@@ -1,10 +1,12 @@
 """Download the Windows tools and model used by RIFE Movie Converter."""
+import filecmp
+import hashlib
 import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
-from tempfile import TemporaryDirectory
+from tempfile import NamedTemporaryFile, TemporaryDirectory
 from zipfile import ZipFile
 
 ROOT = Path(__file__).resolve().parent
@@ -41,6 +43,39 @@ def fetch(url, destination):
 def extract(archive, destination, *options):
     destination.mkdir(parents=True, exist_ok=True)
     run("tar.exe", "-xf", archive, "-C", destination, *options)
+
+
+def install_frame_transport(temp):
+    host = RUNTIME / "probe"
+    library = host / "VSScript.dll"
+    sources = []
+    if not library.is_file() or hashlib.sha256(library.read_bytes()).hexdigest() != (
+        "8722117f6cfc9bfafab445da4a10d70f9b7bc227b9312a0edc4df15128c9a6ad"
+    ):
+        archive = temp / "vapoursynth-r73.zip"
+        fetch("https://github.com/vapoursynth/vapoursynth/releases/download/R73/"
+              "VapourSynth64-Portable-R73.zip", archive)
+        digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+        if digest != "3326f10d0fdcdec45649a474cbc9810795ab3da422634d0f134bca6089afbb91":
+            raise RuntimeError("Unexpected VapourSynth R73 archive checksum.")
+        with ZipFile(archive) as package:
+            member = next(name for name in package.namelist() if Path(name).name.lower() == "vsscript.dll")
+            (temp / library.name).write_bytes(package.read(member))
+        sources.append(temp / library.name)
+    base = Path(sys.base_prefix)
+    sources.extend((base / "python3.dll", base / f"python{sys.version_info.major}{sys.version_info.minor}.dll",
+                    Path(sys.prefix) / "Lib/site-packages/vapoursynth.dll"))
+    for source in sources:
+        destination = host / source.name
+        if not destination.exists() or not filecmp.cmp(source, destination, shallow=False):
+            with NamedTemporaryFile(dir=host, delete=False) as staging:
+                staged = Path(staging.name)
+            try:
+                shutil.copy2(source, staged)
+                staged.replace(destination)
+            finally:
+                staged.unlink(missing_ok=True)
+    (host / "portable.vs").touch(exist_ok=True)
 
 
 def gpu_resource():
@@ -129,6 +164,10 @@ def install_runtime(temp):
         fetch(f"{VSMLRT}/model-20211209/dpir_v3.7z", archive)
         extract(archive, PLUGINS / "models", "dpir/drunet_deblocking_color.onnx")
     install_tensor_rt(temp, resource)
+    try:
+        install_frame_transport(temp)
+    except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
+        print(f"Portable VapourSynth setup skipped ({error}). The Y4M pipe is available.", flush=True)
     run(RUNTIME / "probe" / "ffprobe.exe", "-version", stdout=subprocess.DEVNULL)
     print("Runtime ready.", flush=True)
 
