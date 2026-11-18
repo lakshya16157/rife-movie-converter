@@ -33,7 +33,7 @@ GPU_QUERY = ["nvidia-smi", "-i", "0", "--format=csv,noheader,nounits"]
 STAT_COLUMNS = (
     ("when", "When", 105), ("gpu", "GPU", 110), ("output", "Output", 85), ("multiplier", "Rate", 45),
     ("cleanup", "Cleanup", 130), ("parallel", "Parallel", 55), ("fps", "Output fps", 70),
-    ("speed", "× playback", 70), ("mps", "Megapixels/s", 80), ("gpu_load", "GPU %", 50),
+    ("speed", "Playback speed", 95), ("mps", "Megapixels/s", 80), ("gpu_load", "GPU %", 50),
     ("encoder_load", "Encoder %", 65), ("vram", "VRAM GB", 60),
 )
 
