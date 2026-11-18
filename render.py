@@ -13,11 +13,11 @@ def frames(job):
     import vapoursynth as vs
 
     core = vs.core
-    core.max_cache_size = 768
+    core.max_cache_size = 4096  # 4K RGB float frames are ~73 MB each
     core.std.LoadPlugin(str(PLUGINS / "ffms2.dll"))
     print("Indexing the movie for frame-accurate decodingâ€¦", file=sys.stderr, flush=True)
     source = core.ffms2.Source(
-        job["source"], track=job["track"], threads=4, cachefile=job["index"]
+        job["source"], track=job["track"], threads=8, cachefile=job["index"]
     )
     nominal_rate = Fraction(job["source_rate"])
     # FFMS2 retains exact frame count for CFR inputs. Snap tiny container FPS rounding.
@@ -64,7 +64,7 @@ def frames(job):
     vsmlrt.trtexec_path = str(runtime / "trtexec.exe")
 
     def trt():
-        return Backend.TRT(fp16=True, num_streams=1, workspace=2048, builder_optimization_level=3)
+        return Backend.TRT(fp16=True, num_streams=2, workspace=2048, builder_optimization_level=3)
 
     # Clean up before RIFE so real and generated frames get the same treatment.
     if strength := job.get("deblock"):
@@ -119,4 +119,4 @@ if __name__ == "__main__":
     with os.fdopen(os.dup(sys.stdout.fileno()), "wb") as pipe:
         os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
         output = frames(job)
-        output.output(pipe, y4m=True, prefetch=2)
+        output.output(pipe, y4m=True, prefetch=8)
