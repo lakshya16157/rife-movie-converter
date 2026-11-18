@@ -28,13 +28,24 @@ CACHE.mkdir(exist_ok=True)
 HIDDEN = {"creationflags": subprocess.CREATE_NO_WINDOW}
 PREFERRED_MOVIE = CACHE / "preferred-movie.txt"
 STATS = RUNTIME / "benchmarks.csv"
+GPU_DEFAULTS = CACHE / "gpu-defaults.json"
 GPU_QUERY = ["nvidia-smi", "-i", "0", "--format=csv,noheader,nounits"]
+# Task Manager's "3D" graph: the 3D engine summed over every process on the adapter the encoder runs on.
+# Prints one whole number every two seconds. English counter names only; elsewhere the column stays 0.
+ENGINE_3D = (
+    "while ($true) { $s = (Get-Counter '\\GPU Engine(*engtype_3D)\\Utilization Percentage' -ErrorAction "
+    "SilentlyContinue).CounterSamples; $luid = $null; foreach ($x in $s) { if ($x.InstanceName -match "
+    "'pid_%d_luid_(0x[0-9a-f]+_0x[0-9a-f]+)') { $luid = $Matches[1]; break } }; if ($luid) { [int]($s | "
+    "Where-Object { $_.InstanceName -like ('*luid_' + $luid + '*') } | Measure-Object CookedValue -Sum).Sum }; "
+    "Start-Sleep -Seconds 1 }"
+)
 # key, heading, width. One row per export; megapixels/s compares runs at different sizes.
 STAT_COLUMNS = (
     ("when", "When", 105), ("gpu", "GPU", 110), ("output", "Output", 85), ("multiplier", "Rate", 45),
     ("cleanup", "Cleanup", 130), ("parallel", "Parallel", 55), ("fps", "Output fps", 70),
     ("speed", "Playback speed", 95), ("mps", "Megapixels/s", 80), ("gpu_load", "GPU %", 50),
-    ("encoder_load", "Encoder %", 65), ("vram", "VRAM GB", 60),
+    ("gpu_3d", "3D %", 45), ("encoder_load", "Encoder %", 65), ("vram", "VRAM GB", 60),
+    ("encoder", "Encoder", 70),
 )
 
 RESOLUTIONS = {
@@ -45,6 +56,8 @@ RESOLUTIONS = {
 }
 GRAIN = {"Off": (0, 0), "Light": (1.2, 3), "Medium": (2.5, 5), "Strong": (4.0, 8)}  # (NLMeans h, BM3D sigma)
 GRAIN_METHODS = ("Fast (NLMeans)", "Best (BM3D)")
+# NVENC preset and multipass mode. Fast is the RTX 3090 tuning; Best is free only where the encoder has headroom.
+ENCODERS = {"Fast (P5 single-pass)": ("p5", "disabled"), "Best (P7 two-pass)": ("p7", "fullres")}
 DEBLOCK = {"Off": 0, "Light": 20, "Medium": 35, "Strong": 50}  # DPIR strength
 FRAME_RATES = ("2", "2.5", "3", "4", "6", "10", "60 fps")  # suggestions; any multiplier above 1, up to 32
 RATE_ERROR = "Enter a frame multiplier above 1 and up to 32 (for example 2 or 2.5), or 60 fps."
@@ -77,6 +90,31 @@ def output_sar(video, size):
     width, height = size
     return (Fraction(sar.replace(":", "/")) * Fraction(video["width"], video["height"])
             * Fraction(height, width))
+
+
+def best_encoder(gpu):
+    """Default Encoder setting for this card. Measured once per GPU, then read from the cache."""
+    try:
+        saved = json.loads(GPU_DEFAULTS.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        saved = {}
+    if gpu not in saved:
+        def seconds(split):
+            started = time.monotonic()
+            done = subprocess.run(
+                [FFMPEG, "-v", "error", "-f", "lavfi", "-i", "color=s=3840x2160:r=60", "-frames:v", "120",
+                 "-c:v", "hevc_nvenc", "-profile:v", "main10", "-pix_fmt", "p010le", "-preset", "p7",
+                 "-multipass", "fullres", "-split_encode_mode", split, "-f", "null", "-"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **HIDDEN)
+            return math.inf if done.returncode else time.monotonic() - started
+
+        plain, split = seconds("disabled"), seconds("forced")
+        if plain == math.inf:
+            return next(iter(ENCODERS))  # no working NVENC to measure; keep the fast preset and retry next start
+        # Split encoding is only much faster with a second encoder chip, and then the slow preset is nearly free.
+        saved[gpu] = split < 0.75 * plain
+        GPU_DEFAULTS.write_text(json.dumps(saved), encoding="utf-8")
+    return list(ENCODERS)[saved[gpu]]
 
 
 def timecode(seconds):
@@ -215,12 +253,16 @@ class Preview:
 
 class Export:
     def __init__(self, source, output, video, source_rate, target, duration, bitrate, sample, events,
-                 resolution="Source", denoise=0, bm3d=0, deblock=0, parallel=1, labels=None):
+                 resolution="Source", denoise=0, bm3d=0, deblock=0, parallel=1, labels=None,
+                 encoder=("p5", "disabled")):
         self.denoise, self.bm3d, self.deblock, self.parallel = denoise, bm3d, deblock, parallel
-        self.labels = dict(labels or {}, when=time.strftime("%Y-%m-%d %H:%M"))
+        self.preset, self.multipass = encoder
+        self.labels = dict(labels or {}, when=time.strftime("%Y-%m-%d %H:%M"),
+                           encoder=self.preset.upper() + ("" if self.multipass == "disabled" else " 2-pass"))
         self.stats = None
         self.first = None  # (time, frame) of the first encoded frame, so engine builds do not count
         self.samples = []
+        self.engine = []
         self.source, self.output = source, output
         self.path = output.with_suffix(".partial.mkv")
         self.video, self.source_rate, self.target = video, source_rate, target
@@ -250,6 +292,11 @@ class Export:
             if self.first and len(sample) == 3:
                 self.samples.append(sample)
 
+    def sample_3d(self, counters):
+        for line in counters.stdout:
+            if self.first and line.strip().isdigit():
+                self.engine.append(int(line))
+
     def measure(self, frame):
         now = time.monotonic()
         if frame and self.first is None:
@@ -263,6 +310,7 @@ class Export:
         self.stats = dict(
             self.labels, fps=round(fps, 1), speed=round(fps / float(self.target), 2),
             mps=round(fps * width * height / 1e6), gpu_load=round(sum(gpu) / len(gpu)),
+            gpu_3d=round(sum(self.engine) / len(self.engine)) if self.engine else 0,
             encoder_load=round(sum(encoder) / len(encoder)), vram=round(max(memory) / 1024, 1),
         )
 
@@ -284,7 +332,7 @@ class Export:
 
     def run(self):
         worker = None
-        monitor = None
+        monitor = counters = None
         lock = None
         try:
             lock = (CACHE / "export.lock").open("a+b")
@@ -332,7 +380,8 @@ class Export:
                     "-map", "0:v:0", "-map", "1:a?", "-map", "2:s?", "-map", "2:t?",
                     "-map_metadata", "1", "-map_chapters", "-1" if self.sample else "1",
                     "-c:a", "copy", "-c:s", "copy", "-c:t", "copy", "-c:v", "hevc_nvenc", "-profile:v", "main10", "-pix_fmt", "p010le",
-                    "-preset", "p5", "-tune", "hq", "-multipass", "disabled", "-spatial-aq", "1", "-temporal-aq", "1",
+                    "-preset", self.preset, "-tune", "hq", "-multipass", self.multipass,
+                    "-spatial-aq", "1", "-temporal-aq", "1",
                     "-rc-lookahead", "32", *self.split_encode(), "-rc", "vbr", "-b:v", f"{self.bitrate}M",
                     "-maxrate", f"{self.bitrate * 2}M", "-bufsize", f"{self.bitrate * 2}M",
                     "-g", str(round(self.target * 2)), "-color_range", "pc" if full else "tv"]
@@ -364,6 +413,10 @@ class Export:
                             [*GPU_QUERY, "--query-gpu=utilization.gpu,utilization.encoder,memory.used", "-l", "2"],
                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, **HIDDEN)
                         threading.Thread(target=self.sample_gpu, args=(monitor,), daemon=True).start()
+                        counters = subprocess.Popen(
+                            ["powershell", "-NoProfile", "-Command", ENGINE_3D % encoder.pid],
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, **HIDDEN)
+                        threading.Thread(target=self.sample_3d, args=(counters,), daemon=True).start()
                     except OSError:
                         pass  # no nvidia-smi: the stats table shows zeros for GPU load
                     progress = {}
@@ -394,8 +447,9 @@ class Export:
             self.events.put(("error", str(error)))
         finally:
             try:
-                if monitor:
-                    monitor.kill()
+                for sampler in (monitor, counters):
+                    if sampler:
+                        sampler.kill()
                 self.stop_worker(worker)
                 self.config.unlink(missing_ok=True)
             finally:
@@ -418,9 +472,9 @@ class Export:
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("RIFE Movie Converter — RTX 3090")
-        self.geometry("1010x900")
-        self.minsize(1000, 880)
+        self.title("RIFE Movie Converter")
+        self.geometry("1130x940")
+        self.minsize(1120, 920)
         self.source = None
         self.job = None
         self.events = queue.Queue()
@@ -429,12 +483,17 @@ class App(tk.Tk):
         self.bitrate = tk.StringVar(value="Auto")
         self.grain = tk.StringVar(value="Off")
         self.parallel = tk.StringVar(value="1")
+        self.encoder_quality = tk.StringVar(value=next(iter(ENCODERS)))
         self.live = None
         try:
             self.gpu = subprocess.run([*GPU_QUERY, "--query-gpu=name"], capture_output=True, text=True,
                                       **HIDDEN).stdout.strip().removeprefix("NVIDIA ").removeprefix("GeForce ")
         except OSError:
             self.gpu = ""
+        self.detected = None
+        if self.gpu:
+            threading.Thread(target=lambda: setattr(self, "detected", best_encoder(self.gpu)), daemon=True).start()
+            self.title(f"RIFE Movie Converter — {self.gpu}")
         self.grain_method = tk.StringVar(value=GRAIN_METHODS[0])
         self.deblock = tk.StringVar(value="Off")
         self.movie = tk.StringVar(value="Choose a movie to get started.")
@@ -476,6 +535,8 @@ class App(tk.Tk):
                                           state="readonly", width=14)
         self.deblock_option = ttk.Combobox(table, textvariable=self.deblock, values=tuple(DEBLOCK), width=14)
         self.parallel_entry = ttk.Entry(table, textvariable=self.parallel, width=17)
+        self.encoder_option = ttk.Combobox(table, textvariable=self.encoder_quality, values=tuple(ENCODERS),
+                                           state="readonly", width=20)
         rows = (
             ("Resolution", self.resolution_option,
              "Output size. Source keeps the original size; the others only scale down."),
@@ -495,6 +556,10 @@ class App(tk.Tk):
             ("Parallel processing", self.parallel_entry,
              "Scales how many frames are worked on at once. 1 is the tested default. Lower it (0.5) if memory "
              "runs out; raise it (1.5 or 2) if the GPU and CPU are not busy. From 0.25 to 4."),
+            ("Encoder", self.encoder_option,
+             "Best gives slightly higher quality at the same bitrate. It is nearly free on cards with two encoder "
+             "chips and about 30% slower on cards with one. The default comes from a one-time speed test of "
+             "this card's encoder."),
         )
         for row, (name, control, description) in enumerate(rows, start=2):
             ttk.Label(table, text=name).grid(row=row, column=0, sticky="nw", padx=(0, 16), pady=4)
@@ -602,7 +667,7 @@ class App(tk.Tk):
         for control in (self.pick, self.start, self.sample, self.bitrate_entry, self.fps_option,
                         self.grain_option, self.deblock_option, self.parallel_entry):
             control.configure(state="disabled" if busy else "normal")
-        for control in (self.resolution_option, self.method_option):
+        for control in (self.resolution_option, self.method_option, self.encoder_option):
             control.configure(state="disabled" if busy else "readonly")
         self.stop.configure(state="normal" if busy else "disabled")
 
@@ -648,7 +713,7 @@ class App(tk.Tk):
         self.job = Export(self.source, path, self.video, self.source_rate, target,
                           self.duration, bitrate, sample, self.events, resolution=resolution,
                           deblock=deblock, denoise=h if fast else 0, bm3d=0 if fast else sigma,
-                          parallel=parallel, labels=dict(
+                          parallel=parallel, encoder=ENCODERS[self.encoder_quality.get()], labels=dict(
                               gpu=self.gpu, output=f"{width}x{height}", parallel=f"{parallel:g}",
                               multiplier=f"{float(target / self.source_rate):.3g}x",
                               cleanup=" + ".join(cleanup) or "none"))
@@ -671,6 +736,10 @@ class App(tk.Tk):
             messagebox.showerror("Could not open player", str(error))
 
     def poll(self):
+        if self.detected:
+            if self.encoder_quality.get() == next(iter(ENCODERS)) and not (self.job and not self.job.done.is_set()):
+                self.encoder_quality.set(self.detected)
+            self.detected = None
         while not self.events.empty():
             event, data = self.events.get_nowait()
             if event == "progress":
@@ -695,12 +764,16 @@ class App(tk.Tk):
             else:
                 self.set_busy(False)
                 if stats := self.job.stats:
-                    new = not STATS.is_file()
-                    with STATS.open("a", newline="", encoding="utf-8") as file:
-                        writer = csv.DictWriter(file, [key for key, _, _ in STAT_COLUMNS])
-                        if new:
-                            writer.writeheader()
-                        writer.writerow(stats)
+                    # Rewrite the whole (small) file so rows from older versions gain any new columns.
+                    rows = []
+                    if STATS.is_file():
+                        with STATS.open(newline="", encoding="utf-8") as file:
+                            rows = list(csv.DictReader(file))
+                    with STATS.open("w", newline="", encoding="utf-8") as file:
+                        writer = csv.DictWriter(file, [key for key, _, _ in STAT_COLUMNS], restval="",
+                                                extrasaction="ignore")
+                        writer.writeheader()
+                        writer.writerows([*rows, stats])
                     self.stats_button.configure(state="normal")
                 if event == "complete":
                     self.percent.set(100)

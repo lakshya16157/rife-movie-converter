@@ -17,12 +17,13 @@ See [SETUP.md](SETUP.md) for GPU requirements, download sizes, and troubleshooti
 - **Auto** uses a video bitrate based on the resolution. Enter a number to override it. The app shows an estimated size before export.
 - **Grain reduction** (Off by default; Light, Medium, Strong, or a typed strength from 0 to 20) denoises before interpolation so real and generated frames match. **Method** picks **Fast (NLMeans)** or the slower, more detail-preserving **Best (BM3D)**.
 - **Deblocking** (Off by default; Light, Medium, Strong, or a typed strength from 0 to 100) runs the DPIR model on the GPU to repair blocky compression damage in low-bitrate sources. It slows exports and builds its own TensorRT engine on first use.
+- **Encoder** picks the NVENC preset: **Fast (P5 single-pass)**, tuned for single-encoder cards such as the RTX 3090, or **Best (P7 two-pass)**, which costs almost nothing on cards with two encoder chips. On first start the app times the card's encoder for a few seconds and picks the default; the answer is cached in `runtime/cache/gpu-defaults.json`.
 - **Parallel processing** scales how many frames are worked on at once. 1 is the tested default; lower it if memory runs out.
 - The app supports progressive, constant-frame-rate SDR, HDR10, and HLG. Supported Dolby Vision Profile 5 and 8 video is mapped to HDR10. Profile 7 uses its HDR10 base layer.
 
 ## Performance table
 
-Each export adds a row with the GPU, output size, settings, output fps, playback speed, megapixels per second, average GPU and encoder load, and peak video memory. Timing starts at the first encoded frame, so engine builds do not count. Megapixels per second compares runs at different resolutions. Rows are saved to `runtime/benchmarks.csv`; copy that file between PCs to compare GPUs.
+Each export adds a row with the GPU, output size, settings, output fps, playback speed, megapixels per second, average GPU load, Task Manager's 3D load, encoder load, peak video memory, and the encoder preset. Timing starts at the first encoded frame, so engine builds do not count. Megapixels per second compares runs at different resolutions. Rows are saved to `runtime/benchmarks.csv`; copy that file between PCs to compare GPUs.
 
 Exports use both NVENC chips on cards that have two, after a one-frame probe confirms the card accepts split encoding.
 

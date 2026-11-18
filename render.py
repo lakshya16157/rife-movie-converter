@@ -74,7 +74,10 @@ def frames(job):
         clean = original.resize.Bicubic(format=vs.RGBS, matrix_in_s=matrix, range_in_s=range_in,
                                         chromaloc_in_s=chroma)
         pad_w, pad_h = (-clean.width) % 8, (-clean.height) % 8
+        # TensorRT cannot build DPIR for a whole 4K frame in this workspace; split big frames into tiles.
+        tiles = (-(-clean.width // 1920), -(-clean.height // 1088))
         clean = DPIR(clean.std.AddBorders(right=pad_w, bottom=pad_h), strength=strength,
+                     tiles=None if tiles == (1, 1) else tiles,
                      model=DPIRModel.drunet_deblocking_color, backend=trt())
         original = clean.std.Crop(right=pad_w, bottom=pad_h).resize.Bicubic(
             format=vs.YUV420P10, matrix_s=matrix, range_s=range_in, chromaloc_s=chroma,
@@ -107,7 +110,7 @@ def frames(job):
     pad_w, pad_h = (-rgb.width) % 64, (-rgb.height) % 64
     padded = rgb.std.AddBorders(right=pad_w, bottom=pad_h)
     result = RIFE(padded, multi=ratio, model=RIFEModel.v4_25,
-                  backend=trt(half_io=matrix == "709" and ratio == 2), _implementation=2)
+                  backend=trt(half_io=matrix == "709"), _implementation=2)
     result = result.std.Crop(right=pad_w, bottom=pad_h)
     result = result.resize.Bicubic(format=vs.YUV420P10, matrix_s=matrix, range_s=range_in, chromaloc_s=chroma)
     if ratio.denominator == 1:
