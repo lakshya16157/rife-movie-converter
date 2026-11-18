@@ -118,6 +118,12 @@ def install_runtime(temp):
         archive = temp / "rife.7z"
         fetch(f"{VSMLRT}/external-models/rife_v4.25.7z", archive)
         extract(archive, MODELS.parent, "--include", "rife_v2/*")
+    lite_name = "rife_v4.25_lite.onnx"
+    if not (MODELS / lite_name).is_file():
+        archive = temp / "rife-lite.7z"
+        fetch(f"{VSMLRT}/external-models/rife_v4.25_lite.7z", archive)
+        extract(archive, temp, f"rife_v2/{lite_name}")
+        shutil.move(temp / "rife_v2" / lite_name, MODELS / lite_name)
     if not (PLUGINS / "models" / "dpir" / "drunet_deblocking_color.onnx").is_file():
         archive = temp / "dpir.7z"  # optional deblocking model, about 480 MB download
         fetch(f"{VSMLRT}/model-20211209/dpir_v3.7z", archive)

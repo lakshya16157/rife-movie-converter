@@ -12,6 +12,7 @@ See [SETUP.md](SETUP.md) for GPU requirements, download sizes, and troubleshooti
 
 ## Export settings
 
+- **RIFE model** defaults to **Standard**. **Lite** uses the RIFE 4.25 Lite weights at the selected output size. To keep 4K, leave **Resolution** on **Source**. Existing installations can get the weights by running **Set Up RIFE.cmd** once.
 - **Source**, **1440p**, **1080p**, and **720p** control the export resolution. Downsampling uses VapourSynth Spline36 before inference and preserves the aspect ratio.
 - **Frame multiplier** defaults to **2**: a 23.976 fps movie becomes 47.952 fps. Type any number above 1, up to 32 (2.5 turns 23.976 fps into 59.94), or pick **60 fps**. Whole numbers keep every original frame; other values regenerate most frames. Higher multipliers take longer and need more bitrate; the app shows a bitrate guide in the settings table. RIFE skips interpolation across detected cuts.
 - **Auto** uses a video bitrate based on the resolution. Enter a number to override it. The app shows an estimated size before export.

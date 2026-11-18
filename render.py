@@ -103,13 +103,15 @@ def frames(job):
 
     rgb = core.std.ModifyFrame(rgb, clips=[rgb, scores], selector=mark_cut)
 
-    print("Preparing RIFE 4.25 (TensorRT)...", file=sys.stderr, flush=True)
+    lite_model = job.get("lite_model", False)
+    model = RIFEModel.v4_25_lite if lite_model else RIFEModel.v4_25
+    print(f"Preparing RIFE 4.25{' Lite' if lite_model else ''} (TensorRT)...", file=sys.stderr, flush=True)
     ratio = Fraction(job["output_rate"]) / nominal_rate
     if ratio.denominator != 1:
         core.std.LoadPlugin(str(PLUGINS / "akarin.dll"))
     pad_w, pad_h = (-rgb.width) % 64, (-rgb.height) % 64
     padded = rgb.std.AddBorders(right=pad_w, bottom=pad_h)
-    result = RIFE(padded, multi=ratio, model=RIFEModel.v4_25,
+    result = RIFE(padded, multi=ratio, model=model,
                   backend=trt(half_io=matrix == "709"), _implementation=2)
     result = result.std.Crop(right=pad_w, bottom=pad_h)
     result = result.resize.Bicubic(format=vs.YUV420P10, matrix_s=matrix, range_s=range_in, chromaloc_s=chroma)

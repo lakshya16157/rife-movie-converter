@@ -47,3 +47,28 @@ Raising the TensorRT builder optimization level from 3 to 5 took over six minute
 | Lowest sampled frame | 95.998 | 94.827 | 94.316 |
 
 The largest paired VMAF drop for an individual sampled frame was 2.0 points. The launcher keeps both spatial and temporal adaptive quantization and 32-frame lookahead. Its scene B export was 24.43 MB versus 24.47 MB upstream. The two local MKVs in the **Benchmark samples** folder can be viewed at native resolution for a visual comparison.
+
+## Running RIFE differently on the RTX 3090
+
+The baseline for this comparison was the Standard model on `main` at `b2619f9`. The same PC exported three 12-second scenes near 24:00, 1:30:00 and 1:50:30 from the 3840×1586 film. Each export produced 576 frames at 2×, using 10-bit HEVC P5 at 15.5 Mb/s with AAC audio copied. The table sums the elapsed times with warm engines. Each scene used a different model order. A first export at a new size can also include engine compilation. [Published Standard and Lite weights](https://github.com/AmusementClub/vs-mlrt/releases/tag/external-models)
+
+| Model and execution method | Time for 36 s of film | 4K VMAF against withheld film frames |
+|---|---:|---:|
+| Standard RIFE 4.25, mixed FP16/FP32 | 39.60 s | 87.29 |
+| RIFE 4.25 Lite, same precision and full resolution | 36.47 s | 87.11 |
+| Half-resolution motion estimation, native-resolution warp with FP32 coordinates | 36.53 s | 86.77 |
+| Standard with 40 residual convolutions quantized to INT8 | 41.05 s | 81.99 |
+
+The desktop app also exported the same 30-second scene with each selectable model. Standard took 29.55 s and Lite took 27.42 s. The app displayed 52.6 and 57.0 output frames/s respectively after startup. Both files contained 1,438 Main 10 video frames at 3840×1586 and 1,409 AAC packets.
+
+To measure interpolation accuracy, every other film frame was withheld. Each model reconstructed the missing frames from their neighbors. The scores above use 72 generated frames before video encoding, in three short sequences per scene. Lite averaged 0.18 VMAF points below Standard. Its worst paired drop was 3.19 points. A crop of that frame showed a tightly spaced pattern of vertical ridges, with softer and displaced detail in Lite. In the ordinary 23.976 → 47.952 fps exports, 81 sampled generated frames from the encoded Lite output scored 99.97 on average against encoded Standard, with a minimum of 99.14. That second comparison measures agreement between models. Only the withheld frames provide a real reference for interpolation accuracy.
+
+The INT8 experiment used symmetric activation scales calibrated on 36 frame pairs from separate timestamps, per-output-channel weight scales, and explicit ONNX quantize/dequantize operations. The motion heads and warping operations kept their existing precision. These results apply to that calibration and layer selection on this 3090. [TensorRT quantization documentation](https://docs.nvidia.com/deeplearning/tensorrt/10.x.x/inference-library/work-quantized-types.html)
+
+The motion experiment ran the Standard model's flow and blend-mask prediction at half width and height, upsampled those predictions, and used them to warp and blend the original 4K RGB frames. Precision in the final sampling coordinates mattered. The first implementation scored 74.50 on the withheld frames. Explicit FP32 coordinate math and final sampling raised that to 86.77. The corrected version used about 5.1 GB of total reported GPU memory during export, versus about 7.0 GB with Lite, and scored 99.78 against the ordinary encoded Standard output.
+
+With Lite, switching NVENC from P5 to P4 saved 0.39 seconds across the three exports combined. A 4 MiB Windows pipe saved 0.19 seconds on the single Lite scene tested. Across all three test segments, none of the 861 adjacent source-frame pairs had matching decoded-frame checksums, so an exact-duplicate shortcut would have skipped no inference on this sample.
+
+On scene B, Lite's elapsed export times at parallel settings 1, 1.5 and 2 were 12.42, 12.69 and 12.80 seconds. Total GPU memory reported rose from 7.0 to 8.4 and 9.9 GB. The half-resolution motion prototype also finished fastest at 1 on this scene.
+
+A separate 2.5× compatibility check used a 24-frame, 24 fps input. Both Standard and Lite produced 59 frames tagged at 60 fps. The bundled fractional scheduler stops after the first repeated final source frame. All 2× exports in the comparison produced the full expected frame count.

@@ -41,7 +41,7 @@ ENGINE_3D = (
 )
 # key, heading, width. One row per export; megapixels/s compares runs at different sizes.
 STAT_COLUMNS = (
-    ("when", "When", 105), ("gpu", "GPU", 110), ("output", "Output", 85), ("multiplier", "Rate", 45),
+    ("when", "When", 105), ("gpu", "GPU", 110), ("output", "Output", 85), ("multiplier", "Rate / model", 85),
     ("cleanup", "Cleanup", 130), ("parallel", "Parallel", 55), ("fps", "Output fps", 70),
     ("speed", "Playback speed", 95), ("mps", "Megapixels/s", 80), ("gpu_load", "GPU %", 50),
     ("gpu_3d", "3D %", 45), ("encoder_load", "Encoder %", 65), ("vram", "VRAM GB", 60),
@@ -254,7 +254,8 @@ class Preview:
 class Export:
     def __init__(self, source, output, video, source_rate, target, duration, bitrate, sample, events,
                  resolution="Source", denoise=0, bm3d=0, deblock=0, parallel=1, labels=None,
-                 encoder=("p5", "disabled")):
+                 encoder=("p5", "disabled"), lite_model=False):
+        self.lite_model = lite_model
         self.denoise, self.bm3d, self.deblock, self.parallel = denoise, bm3d, deblock, parallel
         self.preset, self.multipass = encoder
         self.labels = dict(labels or {}, when=time.strftime("%Y-%m-%d %H:%M"),
@@ -362,7 +363,7 @@ class Export:
                 matrix=matrix, range="full" if full else "limited",
                 chroma=chroma_map.get(chroma, chroma), size=self.size,
                 dovi_map=self.video.get("dovi_map", False), denoise=self.denoise,
-                bm3d=self.bm3d, deblock=self.deblock, parallel=self.parallel,
+                bm3d=self.bm3d, deblock=self.deblock, parallel=self.parallel, lite_model=self.lite_model,
             )
             self.config.write_text(json.dumps(job), encoding="utf-8")
             input_tags = []
@@ -479,6 +480,7 @@ class App(tk.Tk):
         self.job = None
         self.events = queue.Queue()
         self.rate = tk.StringVar(value="2")
+        self.model = tk.StringVar(value="Standard")
         self.resolution = tk.StringVar(value="Source")
         self.bitrate = tk.StringVar(value="Auto")
         self.grain = tk.StringVar(value="Off")
@@ -529,6 +531,8 @@ class App(tk.Tk):
         self.resolution_option = ttk.Combobox(table, textvariable=self.resolution, values=tuple(RESOLUTIONS),
                                               state="readonly", width=14)
         self.fps_option = ttk.Combobox(table, textvariable=self.rate, values=FRAME_RATES, width=14)
+        self.model_option = ttk.Combobox(table, textvariable=self.model, values=("Standard", "Lite"),
+                                         state="readonly", width=14)
         self.bitrate_entry = ttk.Entry(table, textvariable=self.bitrate, width=17)
         self.grain_option = ttk.Combobox(table, textvariable=self.grain, values=tuple(GRAIN), width=14)
         self.method_option = ttk.Combobox(table, textvariable=self.grain_method, values=GRAIN_METHODS,
@@ -540,6 +544,8 @@ class App(tk.Tk):
         rows = (
             ("Resolution", self.resolution_option,
              "Output size. Source keeps the original size; the others only scale down."),
+            ("RIFE model", self.model_option,
+             "Lite runs faster at the selected resolution. Compare a sample for differences around moving edges."),
             ("Frame multiplier", self.fps_option,
              "How many times the frame rate is multiplied. Type any number above 1, up to 32 (2.5 turns 24 fps "
              "into 60), or pick 60 fps. Whole numbers keep every original frame; other values regenerate most "
@@ -667,13 +673,16 @@ class App(tk.Tk):
         for control in (self.pick, self.start, self.sample, self.bitrate_entry, self.fps_option,
                         self.grain_option, self.deblock_option, self.parallel_entry):
             control.configure(state="disabled" if busy else "normal")
-        for control in (self.resolution_option, self.method_option, self.encoder_option):
+        for control in (self.resolution_option, self.method_option, self.encoder_option, self.model_option):
             control.configure(state="disabled" if busy else "readonly")
         self.stop.configure(state="normal" if busy else "disabled")
 
     def export(self, sample):
         try:
             bitrate, target = self.get_bitrate(), self.target()
+            lite_model = self.model.get() == "Lite"
+            if lite_model and not (RUNTIME / "plugins/models/rife_v2/rife_v4.25_lite.onnx").is_file():
+                raise ValueError("Run Set Up RIFE.cmd to install the Lite model.")
             if target <= self.source_rate:
                 raise ValueError("The output rate must be higher than the source rate. Use a multiplier above 1.")
             grain = self.number(self.grain, 0, 20, GRAIN_ERROR, GRAIN)
@@ -713,9 +722,10 @@ class App(tk.Tk):
         self.job = Export(self.source, path, self.video, self.source_rate, target,
                           self.duration, bitrate, sample, self.events, resolution=resolution,
                           deblock=deblock, denoise=h if fast else 0, bm3d=0 if fast else sigma,
-                          parallel=parallel, encoder=ENCODERS[self.encoder_quality.get()], labels=dict(
+                          parallel=parallel, encoder=ENCODERS[self.encoder_quality.get()], lite_model=lite_model,
+                          labels=dict(
                               gpu=self.gpu, output=f"{width}x{height}", parallel=f"{parallel:g}",
-                              multiplier=f"{float(target / self.source_rate):.3g}x",
+                              multiplier=f"{float(target / self.source_rate):.3g}x" + (" Lite" if lite_model else ""),
                               cleanup=" + ".join(cleanup) or "none"))
         self.percent.set(0)
         self.set_busy(True)
