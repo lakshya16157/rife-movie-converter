@@ -1,4 +1,5 @@
 """RIFE Movie Converter for Windows."""
+import csv
 import hashlib
 import json
 import math
@@ -8,6 +9,7 @@ import queue
 import shutil
 import subprocess
 import threading
+import time
 import tkinter as tk
 import uuid
 from fractions import Fraction
@@ -25,6 +27,15 @@ CACHE = RUNTIME / "cache"
 CACHE.mkdir(exist_ok=True)
 HIDDEN = {"creationflags": subprocess.CREATE_NO_WINDOW}
 PREFERRED_MOVIE = CACHE / "preferred-movie.txt"
+STATS = RUNTIME / "benchmarks.csv"
+GPU_QUERY = ["nvidia-smi", "-i", "0", "--format=csv,noheader,nounits"]
+# key, heading, width. One row per export; megapixels/s compares runs at different sizes.
+STAT_COLUMNS = (
+    ("when", "When", 105), ("gpu", "GPU", 110), ("output", "Output", 85), ("multiplier", "Rate", 45),
+    ("cleanup", "Cleanup", 130), ("parallel", "Parallel", 55), ("fps", "Output fps", 70),
+    ("speed", "× playback", 70), ("mps", "Megapixels/s", 80), ("gpu_load", "GPU %", 50),
+    ("encoder_load", "Encoder %", 65), ("vram", "VRAM GB", 60),
+)
 
 RESOLUTIONS = {
     "Source": (None, 15.5),
@@ -35,8 +46,11 @@ RESOLUTIONS = {
 GRAIN = {"Off": (0, 0), "Light": (1.2, 3), "Medium": (2.5, 5), "Strong": (4.0, 8)}  # (NLMeans h, BM3D sigma)
 GRAIN_METHODS = ("Fast (NLMeans)", "Best (BM3D)")
 DEBLOCK = {"Off": 0, "Light": 20, "Medium": 35, "Strong": 50}  # DPIR strength
-FRAME_RATES = ("2", "3", "4", "6", "10", "60 fps")  # suggestions; any whole multiplier from 2 to 32 works
-RATE_ERROR = "Enter a whole frame multiplier from 2 to 32, or 60 fps."
+FRAME_RATES = ("2", "2.5", "3", "4", "6", "10", "60 fps")  # suggestions; any multiplier above 1, up to 32
+RATE_ERROR = "Enter a frame multiplier above 1 and up to 32 (for example 2 or 2.5), or 60 fps."
+GRAIN_ERROR = "Grain reduction: pick a level or enter a strength from 0 to 20."
+DEBLOCK_ERROR = "Deblocking: pick a level or enter a strength from 0 to 100."
+PARALLEL_ERROR = "Parallel processing: enter a number from 0.25 to 4."
 BITRATE_ERROR = "Enter Auto or a video bitrate from 1 to 120 Mb/s."
 BITRATE_NOTE = (
     "Auto, or a number from 1 to 120. Guide at 2×: about 5 Mb/s for 720p, 8 for 1080p, 12 for 1440p and 16 for 4K looks good on clean "
@@ -201,8 +215,12 @@ class Preview:
 
 class Export:
     def __init__(self, source, output, video, source_rate, target, duration, bitrate, sample, events,
-                 resolution="Source", denoise=0, bm3d=0, deblock=0):
-        self.denoise, self.bm3d, self.deblock = denoise, bm3d, deblock
+                 resolution="Source", denoise=0, bm3d=0, deblock=0, parallel=1, labels=None):
+        self.denoise, self.bm3d, self.deblock, self.parallel = denoise, bm3d, deblock, parallel
+        self.labels = dict(labels or {}, when=time.strftime("%Y-%m-%d %H:%M"))
+        self.stats = None
+        self.first = None  # (time, frame) of the first encoded frame, so engine builds do not count
+        self.samples = []
         self.source, self.output = source, output
         self.path = output.with_suffix(".partial.mkv")
         self.video, self.source_rate, self.target = video, source_rate, target
@@ -223,6 +241,41 @@ class Export:
         if self.encoder and self.encoder.poll() is None:
             self.encoder.terminate()
 
+    def sample_gpu(self, monitor):
+        for line in monitor.stdout:
+            try:
+                sample = [float(value) for value in line.split(",")]
+            except ValueError:
+                continue
+            if self.first and len(sample) == 3:
+                self.samples.append(sample)
+
+    def measure(self, frame):
+        now = time.monotonic()
+        if frame and self.first is None:
+            self.first = (now, frame)
+        started, first = self.first or (now, frame)
+        if now - started < 2:
+            return
+        fps = (frame - first) / (now - started)
+        width, height = self.size
+        gpu, encoder, memory = zip(*self.samples) if self.samples else ((0,), (0,), (0,))
+        self.stats = dict(
+            self.labels, fps=round(fps, 1), speed=round(fps / float(self.target), 2),
+            mps=round(fps * width * height / 1e6), gpu_load=round(sum(gpu) / len(gpu)),
+            encoder_load=round(sum(encoder) / len(encoder)), vram=round(max(memory) / 1024, 1),
+        )
+
+    def split_encode(self):
+        # Two-chip NVENC cards encode 4K almost twice as fast in strips. Probe one frame so cards or
+        # frame sizes that reject the mode keep the plain single-chip path.
+        option = ["-split_encode_mode", "forced"]
+        probe = subprocess.run(
+            [FFMPEG, "-v", "error", "-f", "lavfi", "-i", "color=s={}x{}".format(*self.size), "-frames:v", "1",
+             "-c:v", "hevc_nvenc", "-profile:v", "main10", "-pix_fmt", "p010le", *option, "-f", "null", "-"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **HIDDEN)
+        return [] if probe.returncode else option
+
     def stop_worker(self, worker):
         if worker and worker.poll() is None:
             subprocess.run(["taskkill", "/PID", str(worker.pid), "/T", "/F"],
@@ -231,6 +284,7 @@ class Export:
 
     def run(self):
         worker = None
+        monitor = None
         lock = None
         try:
             lock = (CACHE / "export.lock").open("a+b")
@@ -260,7 +314,7 @@ class Export:
                 matrix=matrix, range="full" if full else "limited",
                 chroma=chroma_map.get(chroma, chroma), size=self.size,
                 dovi_map=self.video.get("dovi_map", False), denoise=self.denoise,
-                bm3d=self.bm3d, deblock=self.deblock,
+                bm3d=self.bm3d, deblock=self.deblock, parallel=self.parallel,
             )
             self.config.write_text(json.dumps(job), encoding="utf-8")
             input_tags = []
@@ -277,7 +331,7 @@ class Export:
                     "-map_metadata", "1", "-map_chapters", "-1" if self.sample else "1",
                     "-c:a", "copy", "-c:s", "copy", "-c:t", "copy", "-c:v", "hevc_nvenc", "-profile:v", "main10", "-pix_fmt", "p010le",
                     "-preset", "p7", "-tune", "hq", "-multipass", "fullres", "-spatial-aq", "1", "-temporal-aq", "1",
-                    "-rc-lookahead", "32", "-rc", "vbr", "-b:v", f"{self.bitrate}M",
+                    "-rc-lookahead", "32", *self.split_encode(), "-rc", "vbr", "-b:v", f"{self.bitrate}M",
                     "-maxrate", f"{self.bitrate * 2}M", "-bufsize", f"{self.bitrate * 2}M",
                     "-g", str(round(self.target * 2)), "-color_range", "pc" if full else "tv"]
             tags = [f"range={'full' if full else 'limited'}", f"chroma_location={chroma}"]
@@ -303,13 +357,22 @@ class Export:
                     worker.stdout.close()
                     if self.cancel.is_set():
                         encoder.terminate()
+                    try:
+                        monitor = subprocess.Popen(
+                            [*GPU_QUERY, "--query-gpu=utilization.gpu,utilization.encoder,memory.used", "-l", "2"],
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, **HIDDEN)
+                        threading.Thread(target=self.sample_gpu, args=(monitor,), daemon=True).start()
+                    except OSError:
+                        pass  # no nvidia-smi: the stats table shows zeros for GPU load
                     progress = {}
                     for line in encoder.stdout:
                         key, _, val = line.strip().partition("=")
                         progress[key] = val
                         if key == "progress":
                             frame = int(progress.get("frame", "0"))
-                            fps = float(progress.get("fps", "0"))
+                            self.measure(frame)
+                            # FFmpeg's own average counts the wait for the first frame; prefer ours.
+                            fps = self.stats["fps"] if self.stats else float(progress.get("fps", "0"))
                             self.events.put(("progress", (frame / float(self.target), fps)))
                             progress.clear()
                     encoded = encoder.wait()
@@ -329,6 +392,8 @@ class Export:
             self.events.put(("error", str(error)))
         finally:
             try:
+                if monitor:
+                    monitor.kill()
                 self.stop_worker(worker)
                 self.config.unlink(missing_ok=True)
             finally:
@@ -352,15 +417,22 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("RIFE Movie Converter")
-        self.geometry("920x690")
-        self.minsize(880, 650)
+        self.geometry("1010x900")
+        self.minsize(1000, 880)
         self.source = None
         self.job = None
         self.events = queue.Queue()
         self.rate = tk.StringVar(value="2")
         self.resolution = tk.StringVar(value="Source")
         self.bitrate = tk.StringVar(value="Auto")
-        self.grain = tk.StringVar(value="Medium")
+        self.grain = tk.StringVar(value="Off")
+        self.parallel = tk.StringVar(value="1")
+        self.live = None
+        try:
+            self.gpu = subprocess.run([*GPU_QUERY, "--query-gpu=name"], capture_output=True, text=True,
+                                      **HIDDEN).stdout.strip().removeprefix("NVIDIA ").removeprefix("GeForce ")
+        except OSError:
+            self.gpu = ""
         self.grain_method = tk.StringVar(value=GRAIN_METHODS[0])
         self.deblock = tk.StringVar(value="Off")
         self.movie = tk.StringVar(value="Choose a movie to get started.")
@@ -397,25 +469,30 @@ class App(tk.Tk):
                                               state="readonly", width=14)
         self.fps_option = ttk.Combobox(table, textvariable=self.rate, values=FRAME_RATES, width=14)
         self.bitrate_entry = ttk.Entry(table, textvariable=self.bitrate, width=17)
-        self.grain_option = ttk.Combobox(table, textvariable=self.grain, values=tuple(GRAIN),
-                                         state="readonly", width=14)
+        self.grain_option = ttk.Combobox(table, textvariable=self.grain, values=tuple(GRAIN), width=14)
         self.method_option = ttk.Combobox(table, textvariable=self.grain_method, values=GRAIN_METHODS,
                                           state="readonly", width=14)
-        self.deblock_option = ttk.Combobox(table, textvariable=self.deblock, values=tuple(DEBLOCK),
-                                           state="readonly", width=14)
+        self.deblock_option = ttk.Combobox(table, textvariable=self.deblock, values=tuple(DEBLOCK), width=14)
+        self.parallel_entry = ttk.Entry(table, textvariable=self.parallel, width=17)
         rows = (
             ("Resolution", self.resolution_option,
              "Output size. Source keeps the original size; the others only scale down."),
             ("Frame multiplier", self.fps_option,
-             "How many times the frame rate is multiplied. Type any whole number from 2 to 32, or pick 60 fps. "
-             "Higher is smoother but slower, and interpolation errors show more."),
+             "How many times the frame rate is multiplied. Type any number above 1, up to 32 (2.5 turns 24 fps "
+             "into 60), or pick 60 fps. Whole numbers keep every original frame; other values regenerate most "
+             "frames. Higher is smoother but slower, and interpolation errors show more."),
             ("Video bitrate (Mb/s)", self.bitrate_entry, BITRATE_NOTE),
             ("Grain reduction", self.grain_option,
-             "Removes film grain before interpolation so it does not pulse. Too strong looks waxy."),
+             "Removes film grain before interpolation so it does not pulse. Pick a level or type a strength "
+             "from 0 to 20. Too strong looks waxy."),
             ("Grain method", self.method_option,
              "Fast is NLMeans. Best is BM3D, which keeps more fine detail but is slower."),
             ("Deblocking", self.deblock_option,
-             "Repairs blocky compression damage in low-bitrate sources with the DPIR model. Much slower."),
+             "Repairs blocky compression damage in low-bitrate sources with the DPIR model. Pick a level or type "
+             "a strength from 0 to 100. Much slower."),
+            ("Parallel processing", self.parallel_entry,
+             "Scales how many frames are worked on at once. 1 is the tested default. Lower it (0.5) if memory "
+             "runs out; raise it (1.5 or 2) if the GPU and CPU are not busy. From 0.25 to 4."),
         )
         for row, (name, control, description) in enumerate(rows, start=2):
             ttk.Label(table, text=name).grid(row=row, column=0, sticky="nw", padx=(0, 16), pady=4)
@@ -434,9 +511,23 @@ class App(tk.Tk):
         ttk.Progressbar(panel, variable=self.percent, maximum=100).pack(fill="x", pady=(0, 10))
         ttk.Label(panel, textvariable=self.status, font=("Segoe UI", 10, "bold"), wraplength=610).pack(anchor="w")
         ttk.Label(panel, textvariable=self.detail, wraplength=610).pack(anchor="w", pady=(4, 12))
-        self.log_button = ttk.Button(panel, text="Open export log", state="disabled",
+        self.tree = ttk.Treeview(panel, columns=[key for key, _, _ in STAT_COLUMNS], show="headings", height=6)
+        for key, heading, width in STAT_COLUMNS:
+            self.tree.heading(key, text=heading)
+            self.tree.column(key, width=width, anchor="w", stretch=key == "cleanup")
+        self.tree.pack(fill="x", pady=(0, 10))
+        if STATS.is_file():
+            with STATS.open(newline="", encoding="utf-8") as file:
+                for row in list(csv.DictReader(file))[-30:]:
+                    self.tree.insert("", 0, values=[row.get(key, "") for key, _, _ in STAT_COLUMNS])
+        buttons = ttk.Frame(panel)
+        buttons.pack(fill="x")
+        self.log_button = ttk.Button(buttons, text="Open export log", state="disabled",
                                      command=lambda: os.startfile(self.job.log))
-        self.log_button.pack(anchor="w")
+        self.log_button.pack(side="left", padx=(0, 8))
+        self.stats_button = ttk.Button(buttons, text="Open stats file", command=lambda: os.startfile(STATS),
+                                       state="normal" if STATS.is_file() else "disabled")
+        self.stats_button.pack(side="left")
 
     def choose(self):
         folder = self.source.parent if self.source else Path.home() / "Videos"
@@ -467,24 +558,30 @@ class App(tk.Tk):
         if entered == "60 fps":
             return Fraction(60)
         try:
-            multiplier = int(entered.rstrip("x× "))
-        except ValueError:
+            multiplier = Fraction(entered.rstrip("x× ").replace(",", "."))
+        except (ValueError, ZeroDivisionError):
             raise ValueError(RATE_ERROR) from None
-        if not 2 <= multiplier <= 32:
+        if not 1 < multiplier <= 32:
             raise ValueError(RATE_ERROR)
         return self.source_rate * multiplier
 
-    def get_bitrate(self):
-        entered = self.bitrate.get().strip()
-        if entered.lower() == "auto":
-            return RESOLUTIONS[self.resolution.get()][1]
+    @staticmethod
+    def number(variable, low, high, error, presets=()):
+        entered = variable.get().strip()
+        if entered.title() in presets:
+            return presets[entered.title()]
         try:
-            bitrate = float(entered.replace(",", "."))
+            value = float(entered.replace(",", "."))
         except ValueError:
-            raise ValueError(BITRATE_ERROR) from None
-        if not 1 <= bitrate <= 120:
-            raise ValueError(BITRATE_ERROR)
-        return bitrate
+            raise ValueError(error) from None
+        if not low <= value <= high:
+            raise ValueError(error)
+        return value
+
+    def get_bitrate(self):
+        if self.bitrate.get().strip().lower() == "auto":
+            return RESOLUTIONS[self.resolution.get()][1]
+        return self.number(self.bitrate, 1, 120, BITRATE_ERROR)
 
     def update_estimate(self, *_):
         if self.source:
@@ -500,10 +597,10 @@ class App(tk.Tk):
                 self.estimate.set(str(error))
 
     def set_busy(self, busy):
-        for control in (self.pick, self.start, self.sample, self.bitrate_entry, self.fps_option):
+        for control in (self.pick, self.start, self.sample, self.bitrate_entry, self.fps_option,
+                        self.grain_option, self.deblock_option, self.parallel_entry):
             control.configure(state="disabled" if busy else "normal")
-        for control in (self.resolution_option, self.grain_option,
-                        self.method_option, self.deblock_option):
+        for control in (self.resolution_option, self.method_option):
             control.configure(state="disabled" if busy else "readonly")
         self.stop.configure(state="normal" if busy else "disabled")
 
@@ -511,7 +608,10 @@ class App(tk.Tk):
         try:
             bitrate, target = self.get_bitrate(), self.target()
             if target <= self.source_rate:
-                raise ValueError("The output rate must be higher than the source rate. Use a multiplier of 2 or more.")
+                raise ValueError("The output rate must be higher than the source rate. Use a multiplier above 1.")
+            grain = self.number(self.grain, 0, 20, GRAIN_ERROR, GRAIN)
+            deblock = self.number(self.deblock, 0, 100, DEBLOCK_ERROR, DEBLOCK)
+            parallel = self.number(self.parallel, 0.25, 4, PARALLEL_ERROR)
             if self.video.get("field_order") not in (None, "unknown", "progressive"):
                 raise ValueError("This app currently supports progressive video. Deinterlace this movie first.")
             if self.video.get("color_error"):
@@ -537,12 +637,19 @@ class App(tk.Tk):
             return
         if self.job and self.job.preview:
             self.job.preview.close()
-        h, sigma = GRAIN[self.grain.get()]
+        h, sigma = grain if isinstance(grain, tuple) else (grain, grain)  # a typed number is used as is
         fast = self.grain_method.get() == GRAIN_METHODS[0]
+        width, height = output_size(self.video, resolution)
+        cleanup = [f"{'NLMeans' if fast else 'BM3D'} {h if fast else sigma:g}"] if h else []
+        cleanup += [f"DPIR {deblock:g}"] if deblock else []
+        self.live = None
         self.job = Export(self.source, path, self.video, self.source_rate, target,
                           self.duration, bitrate, sample, self.events, resolution=resolution,
-                          deblock=DEBLOCK[self.deblock.get()],
-                          denoise=h if fast else 0, bm3d=0 if fast else sigma)
+                          deblock=deblock, denoise=h if fast else 0, bm3d=0 if fast else sigma,
+                          parallel=parallel, labels=dict(
+                              gpu=self.gpu, output=f"{width}x{height}", parallel=f"{parallel:g}",
+                              multiplier=f"{float(target / self.source_rate):.3g}x",
+                              cleanup=" + ".join(cleanup) or "none"))
         self.percent.set(0)
         self.set_busy(True)
         self.watch.configure(state="disabled")
@@ -566,6 +673,12 @@ class App(tk.Tk):
             event, data = self.events.get_nowait()
             if event == "progress":
                 rendered, fps = data
+                if stats := self.job.stats:
+                    values = [stats[key] for key, _, _ in STAT_COLUMNS]
+                    if self.live:
+                        self.tree.item(self.live, values=values)
+                    else:
+                        self.live = self.tree.insert("", 0, values=values)
                 self.percent.set(min(99.9, rendered * 100 / self.job.duration))
                 self.status.set(f"Exporting   {timecode(rendered)} / {timecode(self.job.duration)}")
                 speed = fps / float(self.job.target)
@@ -579,6 +692,14 @@ class App(tk.Tk):
                     self.detail.set(f"{speed:.2f}× playback speed   ·   {timecode(left / speed)} estimated remaining{hint}")
             else:
                 self.set_busy(False)
+                if stats := self.job.stats:
+                    new = not STATS.is_file()
+                    with STATS.open("a", newline="", encoding="utf-8") as file:
+                        writer = csv.DictWriter(file, [key for key, _, _ in STAT_COLUMNS])
+                        if new:
+                            writer.writeheader()
+                        writer.writerow(stats)
+                    self.stats_button.configure(state="normal")
                 if event == "complete":
                     self.percent.set(100)
                     self.status.set("Export complete")

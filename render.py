@@ -13,7 +13,8 @@ def frames(job):
     import vapoursynth as vs
 
     core = vs.core
-    core.max_cache_size = 4096  # 4K RGB float frames are ~73 MB each
+    scale = float(job.get("parallel", 1))  # the app's Parallel processing setting
+    core.max_cache_size = max(768, round(4096 * scale))  # 4K RGB frames are 36 to 73 MB each
     core.std.LoadPlugin(str(PLUGINS / "ffms2.dll"))
     print("Indexing the movie for frame-accurate decodingâ€¦", file=sys.stderr, flush=True)
     source = core.ffms2.Source(
@@ -64,7 +65,7 @@ def frames(job):
     vsmlrt.trtexec_path = str(runtime / "trtexec.exe")
 
     def trt():
-        return Backend.TRT(fp16=True, num_streams=2, workspace=2048, builder_optimization_level=3)
+        return Backend.TRT(fp16=True, num_streams=max(1, round(2 * scale)), workspace=2048, builder_optimization_level=3)
 
     # Clean up before RIFE so real and generated frames get the same treatment.
     if strength := job.get("deblock"):
@@ -87,7 +88,8 @@ def frames(job):
             original = core.vszip.NLMeans(original, d=1, a=2, s=4, h=job["denoise"])
     following = original[1:] + original[-1]
     scores = core.std.PlaneStats(original, following, plane=0)
-    rgb = original.resize.Bicubic(format=vs.RGBS, matrix_in_s=matrix, range_in_s=range_in,
+    # Half-float frames: the engine is fp16 inside anyway, and they halve the data moved per frame.
+    rgb = original.resize.Bicubic(format=vs.RGBH, matrix_in_s=matrix, range_in_s=range_in,
                                   chromaloc_in_s=chroma)
 
     def mark_cut(n, f):
@@ -119,4 +121,4 @@ if __name__ == "__main__":
     with os.fdopen(os.dup(sys.stdout.fileno()), "wb") as pipe:
         os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
         output = frames(job)
-        output.output(pipe, y4m=True, prefetch=8)
+        output.output(pipe, y4m=True, prefetch=max(2, round(8 * float(job.get("parallel", 1)))))
