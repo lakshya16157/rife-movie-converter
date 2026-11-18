@@ -32,7 +32,18 @@ RESOLUTIONS = {
     "1080p": ((1920, 1080), 8.0),
     "720p": ((1280, 720), 5.0),
 }
-FRAME_RATES = {"2× source": 2, "3× source": 3, "4× source": 4, "60 fps": None}
+GRAIN = {"Off": (0, 0), "Light": (1.2, 3), "Medium": (2.5, 5), "Strong": (4.0, 8)}  # (NLMeans h, BM3D sigma)
+GRAIN_METHODS = ("Fast (NLMeans)", "Best (BM3D)")
+DEBLOCK = {"Off": 0, "Light": 20, "Medium": 35, "Strong": 50}  # DPIR strength
+FRAME_RATES = ("2", "3", "4", "6", "10", "60 fps")  # suggestions; any whole multiplier from 2 to 32 works
+RATE_ERROR = "Enter a whole frame multiplier from 2 to 32, or 60 fps."
+BITRATE_ERROR = "Enter Auto or a video bitrate from 1 to 120 Mb/s."
+BITRATE_NOTE = (
+    "Auto, or a number from 1 to 120. Guide at 2×: about 5 Mb/s for 720p, 8 for 1080p, 12 for 1440p and 16 for 4K looks good on clean "
+    "video. Below that, expect blocking in dark, grainy or fast scenes. Around double those values the picture "
+    "is close to what the filters produce. Higher multipliers need more: roughly +50% at 4× and double at 10×. "
+    "Auto does not rise with the multiplier, and no bitrate can add detail the source lacks."
+)
 
 
 def output_size(video, resolution):
@@ -190,7 +201,8 @@ class Preview:
 
 class Export:
     def __init__(self, source, output, video, source_rate, target, duration, bitrate, sample, events,
-                 resolution="Source"):
+                 resolution="Source", denoise=0, bm3d=0, deblock=0):
+        self.denoise, self.bm3d, self.deblock = denoise, bm3d, deblock
         self.source, self.output = source, output
         self.path = output.with_suffix(".partial.mkv")
         self.video, self.source_rate, self.target = video, source_rate, target
@@ -247,7 +259,8 @@ class Export:
                 output_rate=str(self.target), sample_seconds=self.duration if self.sample else 0,
                 matrix=matrix, range="full" if full else "limited",
                 chroma=chroma_map.get(chroma, chroma), size=self.size,
-                dovi_map=self.video.get("dovi_map", False),
+                dovi_map=self.video.get("dovi_map", False), denoise=self.denoise,
+                bm3d=self.bm3d, deblock=self.deblock,
             )
             self.config.write_text(json.dumps(job), encoding="utf-8")
             input_tags = []
@@ -263,7 +276,8 @@ class Export:
                     "-map", "0:v:0", "-map", "1:a?", "-map", "1:s?", "-map", "1:t?",
                     "-map_metadata", "1", "-map_chapters", "-1" if self.sample else "1",
                     "-c:a", "copy", "-c:s", "copy", "-c:t", "copy", "-c:v", "hevc_nvenc", "-profile:v", "main10", "-pix_fmt", "p010le",
-                    "-preset", "p6", "-tune", "hq", "-rc", "vbr", "-b:v", f"{self.bitrate}M",
+                    "-preset", "p7", "-tune", "hq", "-multipass", "fullres", "-spatial-aq", "1", "-temporal-aq", "1",
+                    "-rc-lookahead", "32", "-rc", "vbr", "-b:v", f"{self.bitrate}M",
                     "-maxrate", f"{self.bitrate * 2}M", "-bufsize", f"{self.bitrate * 2}M",
                     "-g", str(round(self.target * 2)), "-color_range", "pc" if full else "tv"]
             tags = [f"range={'full' if full else 'limited'}", f"chroma_location={chroma}"]
@@ -338,14 +352,17 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("RIFE Movie Converter")
-        self.geometry("770x465")
-        self.minsize(670, 440)
+        self.geometry("920x690")
+        self.minsize(880, 650)
         self.source = None
         self.job = None
         self.events = queue.Queue()
-        self.rate = tk.StringVar(value="2× source")
+        self.rate = tk.StringVar(value="2")
         self.resolution = tk.StringVar(value="Source")
         self.bitrate = tk.StringVar(value="Auto")
+        self.grain = tk.StringVar(value="Medium")
+        self.grain_method = tk.StringVar(value=GRAIN_METHODS[0])
+        self.deblock = tk.StringVar(value="Off")
         self.movie = tk.StringVar(value="Choose a movie to get started.")
         self.description = tk.StringVar()
         self.estimate = tk.StringVar()
@@ -369,19 +386,42 @@ class App(tk.Tk):
         self.pick.pack(side="left", padx=(0, 12))
         ttk.Label(pick, textvariable=self.movie, wraplength=500).pack(side="left", fill="x")
         ttk.Label(panel, textvariable=self.description).pack(anchor="w", pady=(0, 10))
-        settings = ttk.Frame(panel)
-        settings.pack(fill="x", pady=6)
-        ttk.Label(settings, text="Resolution").pack(side="left")
-        self.resolution_option = ttk.Combobox(settings, textvariable=self.resolution,
-                                              values=tuple(RESOLUTIONS), state="readonly", width=10)
-        self.resolution_option.pack(side="left", padx=(8, 18))
-        ttk.Label(settings, text="Frame rate").pack(side="left")
-        self.fps_option = ttk.Combobox(settings, textvariable=self.rate, values=tuple(FRAME_RATES),
-                                       state="readonly", width=12)
-        self.fps_option.pack(side="left", padx=(8, 20))
-        ttk.Label(settings, text="Video bitrate (Mb/s)").pack(side="left")
-        self.bitrate_entry = ttk.Entry(settings, textvariable=self.bitrate, width=7)
-        self.bitrate_entry.pack(side="left", padx=8)
+        table = ttk.Frame(panel)
+        table.pack(fill="x", pady=6)
+        table.columnconfigure(2, weight=1)
+        for column, heading in enumerate(("Option", "Value", "Description")):
+            ttk.Label(table, text=heading, font=("Segoe UI", 9, "bold")).grid(
+                row=0, column=column, sticky="w", padx=(0, 16), pady=(0, 4))
+        ttk.Separator(table).grid(row=1, column=0, columnspan=3, sticky="ew", pady=(0, 4))
+        self.resolution_option = ttk.Combobox(table, textvariable=self.resolution, values=tuple(RESOLUTIONS),
+                                              state="readonly", width=14)
+        self.fps_option = ttk.Combobox(table, textvariable=self.rate, values=FRAME_RATES, width=14)
+        self.bitrate_entry = ttk.Entry(table, textvariable=self.bitrate, width=17)
+        self.grain_option = ttk.Combobox(table, textvariable=self.grain, values=tuple(GRAIN),
+                                         state="readonly", width=14)
+        self.method_option = ttk.Combobox(table, textvariable=self.grain_method, values=GRAIN_METHODS,
+                                          state="readonly", width=14)
+        self.deblock_option = ttk.Combobox(table, textvariable=self.deblock, values=tuple(DEBLOCK),
+                                           state="readonly", width=14)
+        rows = (
+            ("Resolution", self.resolution_option,
+             "Output size. Source keeps the original size; the others only scale down."),
+            ("Frame multiplier", self.fps_option,
+             "How many times the frame rate is multiplied. Type any whole number from 2 to 32, or pick 60 fps. "
+             "Higher is smoother but slower, and interpolation errors show more."),
+            ("Video bitrate (Mb/s)", self.bitrate_entry, BITRATE_NOTE),
+            ("Grain reduction", self.grain_option,
+             "Removes film grain before interpolation so it does not pulse. Too strong looks waxy."),
+            ("Grain method", self.method_option,
+             "Fast is NLMeans. Best is BM3D, which keeps more fine detail but is slower."),
+            ("Deblocking", self.deblock_option,
+             "Repairs blocky compression damage in low-bitrate sources with the DPIR model. Much slower."),
+        )
+        for row, (name, control, description) in enumerate(rows, start=2):
+            ttk.Label(table, text=name).grid(row=row, column=0, sticky="nw", padx=(0, 16), pady=4)
+            control.grid(row=row, column=1, sticky="nw", padx=(0, 16), pady=4)
+            ttk.Label(table, text=description, wraplength=560, justify="left", foreground="#555555").grid(
+                row=row, column=2, sticky="w", pady=4)
         ttk.Label(panel, textvariable=self.estimate).pack(anchor="w", pady=(1, 12))
         actions = ttk.Frame(panel)
         actions.pack(fill="x", pady=(0, 15))
@@ -423,16 +463,27 @@ class App(tk.Tk):
         self.update_estimate()
 
     def target(self):
-        multiplier = FRAME_RATES[self.rate.get()]
-        return self.source_rate * multiplier if multiplier else Fraction(60)
+        entered = self.rate.get().strip().lower()
+        if entered == "60 fps":
+            return Fraction(60)
+        try:
+            multiplier = int(entered.rstrip("x× "))
+        except ValueError:
+            raise ValueError(RATE_ERROR) from None
+        if not 2 <= multiplier <= 32:
+            raise ValueError(RATE_ERROR)
+        return self.source_rate * multiplier
 
     def get_bitrate(self):
         entered = self.bitrate.get().strip()
         if entered.lower() == "auto":
             return RESOLUTIONS[self.resolution.get()][1]
-        bitrate = float(entered.replace(",", "."))
+        try:
+            bitrate = float(entered.replace(",", "."))
+        except ValueError:
+            raise ValueError(BITRATE_ERROR) from None
         if not 1 <= bitrate <= 120:
-            raise ValueError("Enter Auto or a video bitrate from 1 to 120 Mb/s.")
+            raise ValueError(BITRATE_ERROR)
         return bitrate
 
     def update_estimate(self, *_):
@@ -445,13 +496,14 @@ class App(tk.Tk):
                     f"{width} × {height} at {float(self.target()):.3f} fps   ·   "
                     f"{bitrate:g} Mb/s video   ·   About {size:.1f} GB plus audio and subtitles"
                 )
-            except ValueError:
-                self.estimate.set("Enter Auto or a video bitrate from 1 to 120 Mb/s.")
+            except ValueError as error:
+                self.estimate.set(str(error))
 
     def set_busy(self, busy):
-        for control in (self.pick, self.start, self.sample, self.bitrate_entry):
+        for control in (self.pick, self.start, self.sample, self.bitrate_entry, self.fps_option):
             control.configure(state="disabled" if busy else "normal")
-        for control in (self.resolution_option, self.fps_option):
+        for control in (self.resolution_option, self.grain_option,
+                        self.method_option, self.deblock_option):
             control.configure(state="disabled" if busy else "readonly")
         self.stop.configure(state="normal" if busy else "disabled")
 
@@ -459,7 +511,7 @@ class App(tk.Tk):
         try:
             bitrate, target = self.get_bitrate(), self.target()
             if target <= self.source_rate:
-                raise ValueError("The output rate must be higher than the source rate. Select 2× source.")
+                raise ValueError("The output rate must be higher than the source rate. Use a multiplier of 2 or more.")
             if self.video.get("field_order") not in (None, "unknown", "progressive"):
                 raise ValueError("This app currently supports progressive video. Deinterlace this movie first.")
             if self.video.get("color_error"):
@@ -485,8 +537,12 @@ class App(tk.Tk):
             return
         if self.job and self.job.preview:
             self.job.preview.close()
+        h, sigma = GRAIN[self.grain.get()]
+        fast = self.grain_method.get() == GRAIN_METHODS[0]
         self.job = Export(self.source, path, self.video, self.source_rate, target,
-                          self.duration, bitrate, sample, self.events, resolution=resolution)
+                          self.duration, bitrate, sample, self.events, resolution=resolution,
+                          deblock=DEBLOCK[self.deblock.get()],
+                          denoise=h if fast else 0, bm3d=0 if fast else sigma)
         self.percent.set(0)
         self.set_busy(True)
         self.watch.configure(state="disabled")

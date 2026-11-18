@@ -52,6 +52,39 @@ def frames(job):
         range_in_s=range_in, range_s=range_in, chromaloc_in_s=chroma, chromaloc_s=chroma,
         dither_type="ordered",
     )
+    sys.path.insert(0, str(RUNTIME))
+    runtime = PLUGINS / "vsmlrt-cuda"
+    os.environ["PATH"] = str(runtime) + os.pathsep + os.environ["PATH"]
+    with os.add_dll_directory(str(runtime)):
+        core.std.LoadPlugin(str(PLUGINS / "vstrt.dll"))
+
+    import vsmlrt
+    from vsmlrt import Backend, DPIR, DPIRModel, RIFE, RIFEModel
+
+    vsmlrt.trtexec_path = str(runtime / "trtexec.exe")
+
+    def trt():
+        return Backend.TRT(fp16=True, num_streams=1, workspace=2048, builder_optimization_level=3)
+
+    # Clean up before RIFE so real and generated frames get the same treatment.
+    if strength := job.get("deblock"):
+        print("Preparing DPIR deblocking (TensorRT)...", file=sys.stderr, flush=True)
+        clean = original.resize.Bicubic(format=vs.RGBS, matrix_in_s=matrix, range_in_s=range_in,
+                                        chromaloc_in_s=chroma)
+        pad_w, pad_h = (-clean.width) % 8, (-clean.height) % 8
+        clean = DPIR(clean.std.AddBorders(right=pad_w, bottom=pad_h), strength=strength,
+                     model=DPIRModel.drunet_deblocking_color, backend=trt())
+        original = clean.std.Crop(right=pad_w, bottom=pad_h).resize.Bicubic(
+            format=vs.YUV420P10, matrix_s=matrix, range_s=range_in, chromaloc_s=chroma,
+            dither_type="ordered")
+    if job.get("denoise") or job.get("bm3d"):
+        if not hasattr(core, "vszip"):
+            core.std.LoadPlugin(str(PLUGINS / "vszip.avx2.dll"))
+        if sigma := job.get("bm3d"):
+            original = core.vszip.BM3D(original.resize.Point(format=vs.YUV420PS), sigma=sigma, radius=1)
+            original = original.resize.Point(format=vs.YUV420P10, dither_type="ordered")
+        else:
+            original = core.vszip.NLMeans(original, d=1, a=2, s=4, h=job["denoise"])
     following = original[1:] + original[-1]
     scores = core.std.PlaneStats(original, following, plane=0)
     rgb = original.resize.Bicubic(format=vs.RGBS, matrix_in_s=matrix, range_in_s=range_in,
@@ -63,17 +96,6 @@ def frames(job):
         return frame
 
     rgb = core.std.ModifyFrame(rgb, clips=[rgb, scores], selector=mark_cut)
-    sys.path.insert(0, str(RUNTIME))
-    runtime = PLUGINS / "vsmlrt-cuda"
-    os.environ["PATH"] = str(runtime) + os.pathsep + os.environ["PATH"]
-    with os.add_dll_directory(str(runtime)):
-        core.std.LoadPlugin(str(PLUGINS / "vstrt.dll"))
-
-    import vsmlrt
-    from vsmlrt import Backend, RIFE, RIFEModel
-
-    vsmlrt.trtexec_path = str(runtime / "trtexec.exe")
-    backend = Backend.TRT(fp16=True, num_streams=1, workspace=2048, builder_optimization_level=3)
 
     print("Preparing RIFE 4.25 (TensorRT)...", file=sys.stderr, flush=True)
     ratio = Fraction(job["output_rate"]) / nominal_rate
@@ -82,7 +104,7 @@ def frames(job):
     pad_w, pad_h = (-rgb.width) % 64, (-rgb.height) % 64
     padded = rgb.std.AddBorders(right=pad_w, bottom=pad_h)
     result = RIFE(padded, multi=ratio, model=RIFEModel.v4_25,
-                  backend=backend, _implementation=2)
+                  backend=trt(), _implementation=2)
     result = result.std.Crop(right=pad_w, bottom=pad_h)
     result = result.resize.Bicubic(format=vs.YUV420P10, matrix_s=matrix, range_s=range_in, chromaloc_s=chroma)
     if ratio.denominator == 1:
