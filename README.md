@@ -11,8 +11,10 @@ See [SETUP.md](SETUP.md) for GPU requirements, download sizes, and troubleshooti
 ## Export settings
 
 - **Source**, **1440p**, **1080p**, and **720p** control the export resolution. Downsampling uses VapourSynth Spline36 before inference and preserves the aspect ratio.
-- **2x** is the default. A 23.976 fps movie becomes 47.952 fps. You can also choose **3x**, **4x**, or **60 fps**. RIFE skips interpolation across detected cuts.
+- **Frame multiplier** defaults to **2**: a 23.976 fps movie becomes 47.952 fps. Type any whole number from 2 to 32 (for example 6 or 10), or pick **60 fps**. Higher multipliers take longer and need more bitrate; the app shows a bitrate guide under the estimate. RIFE skips interpolation across detected cuts.
 - **Auto** uses a video bitrate based on the resolution. Enter a number to override it. The app shows an estimated size before export.
+- **Grain reduction** (Off, Light, Medium, Strong) denoises before interpolation so real and generated frames match. **Method** picks **Fast (NLMeans)** or the slower, more detail-preserving **Best (BM3D)**.
+- **Deblocking** (Off by default) runs the DPIR model on the GPU to repair blocky compression damage in low-bitrate sources. It slows exports and builds its own TensorRT engine on first use.
 - The app supports progressive, constant-frame-rate SDR, HDR10, and HLG. Supported Dolby Vision Profile 5 and 8 video is mapped to HDR10. Profile 7 uses its HDR10 base layer.
 
 ## Watch while exporting

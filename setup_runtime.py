@@ -60,14 +60,24 @@ def install_tensor_rt(temp, resource):
     ):
         return
     seven_zip = shutil.which("7z.exe") or Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "7-Zip" / "7z.exe"
-    if not Path(seven_zip).is_file():
-        raise RuntimeError("Install 64-bit 7-Zip before setting up TensorRT.")
     print("Downloading the two TensorRT archives (about 2.5 GiB total).", flush=True)
     for part in ("001", "002"):
         fetch(f"{TRT}.{part}", temp / f"tensorrt.7z.{part}")
     PLUGINS.mkdir(parents=True, exist_ok=True)
-    run(seven_zip, "x", temp / "tensorrt.7z.001", f"-o{PLUGINS}", "-y", "vstrt.dll",
-        *(f"vsmlrt-cuda\\{name}" for name in (*CUDA_DLLS, resource)))
+    members = ("vstrt.dll", *(f"vsmlrt-cuda/{name}" for name in (*CUDA_DLLS, resource)))
+    if Path(seven_zip).is_file():
+        run(seven_zip, "x", temp / "tensorrt.7z.001", f"-o{PLUGINS}", "-y",
+            *(m.replace("/", "\\") for m in members))
+        return
+    # No 7-Zip: split volumes are a plain byte split, so join them and let Windows tar.exe extract.
+    joined = temp / "tensorrt.7z"
+    with open(joined, "wb") as out:
+        for part in ("001", "002"):
+            src = temp / f"tensorrt.7z.{part}"
+            with open(src, "rb") as f:
+                shutil.copyfileobj(f, out, 16 << 20)
+            src.unlink()
+    extract(joined, PLUGINS, *members)
 
 
 def install_runtime(temp):
@@ -108,6 +118,10 @@ def install_runtime(temp):
         archive = temp / "rife.7z"
         fetch(f"{VSMLRT}/external-models/rife_v4.25.7z", archive)
         extract(archive, MODELS.parent, "--include", "rife_v2/*")
+    if not (PLUGINS / "models" / "dpir" / "drunet_deblocking_color.onnx").is_file():
+        archive = temp / "dpir.7z"  # optional deblocking model, about 480 MB download
+        fetch(f"{VSMLRT}/model-20211209/dpir_v3.7z", archive)
+        extract(archive, PLUGINS / "models", "dpir/drunet_deblocking_color.onnx")
     install_tensor_rt(temp, resource)
     run(RUNTIME / "probe" / "ffprobe.exe", "-version", stdout=subprocess.DEVNULL)
     print("Runtime ready.", flush=True)
