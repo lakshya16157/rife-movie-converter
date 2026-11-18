@@ -5,7 +5,7 @@ import sys
 from fractions import Fraction
 from pathlib import Path
 
-RUNTIME = Path(__file__).resolve().parent / "runtime"
+RUNTIME = (Path(__file__).resolve().parent / "runtime").resolve()
 PLUGINS = RUNTIME / "plugins"
 
 
@@ -63,8 +63,9 @@ def frames(job):
 
     vsmlrt.trtexec_path = str(runtime / "trtexec.exe")
 
-    def trt():
-        return Backend.TRT(fp16=True, num_streams=2, workspace=2048, builder_optimization_level=3)
+    def trt(half_io=False):
+        return Backend.TRT(fp16=True, num_streams=2, workspace=2048, builder_optimization_level=3,
+                           output_format=int(half_io), use_cuda_graph=half_io)
 
     # Clean up before RIFE so real and generated frames get the same treatment.
     if strength := job.get("deblock"):
@@ -87,7 +88,10 @@ def frames(job):
             original = core.vszip.NLMeans(original, d=1, a=2, s=4, h=job["denoise"])
     following = original[1:] + original[-1]
     scores = core.std.PlaneStats(original, following, plane=0)
-    rgb = original.resize.Bicubic(format=vs.RGBS, matrix_in_s=matrix, range_in_s=range_in,
+    ratio = Fraction(job["output_rate"]) / nominal_rate
+    # FP16 reduces transfer size while retaining full spatial resolution.
+    half_io = matrix == "709" and ratio == 2
+    rgb = original.resize.Bicubic(format=vs.RGBH if half_io else vs.RGBS, matrix_in_s=matrix, range_in_s=range_in,
                                   chromaloc_in_s=chroma)
 
     def mark_cut(n, f):
@@ -98,13 +102,12 @@ def frames(job):
     rgb = core.std.ModifyFrame(rgb, clips=[rgb, scores], selector=mark_cut)
 
     print("Preparing RIFE 4.25 (TensorRT)...", file=sys.stderr, flush=True)
-    ratio = Fraction(job["output_rate"]) / nominal_rate
     if ratio.denominator != 1:
         core.std.LoadPlugin(str(PLUGINS / "akarin.dll"))
     pad_w, pad_h = (-rgb.width) % 64, (-rgb.height) % 64
     padded = rgb.std.AddBorders(right=pad_w, bottom=pad_h)
     result = RIFE(padded, multi=ratio, model=RIFEModel.v4_25,
-                  backend=trt(), _implementation=2)
+                  backend=trt(half_io), _implementation=2)
     result = result.std.Crop(right=pad_w, bottom=pad_h)
     result = result.resize.Bicubic(format=vs.YUV420P10, matrix_s=matrix, range_s=range_in, chromaloc_s=chroma)
     if ratio.denominator == 1:
