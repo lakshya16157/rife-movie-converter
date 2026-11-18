@@ -326,8 +326,10 @@ class Export:
             args = [FFMPEG, "-hide_banner", "-loglevel", "warning", "-nostdin", "-n",
                     "-progress", "pipe:1", "-stats_period", "1",
                     "-itsoffset", str(self.video["offset"]), *input_tags, "-f", "yuv4mpegpipe", "-i", "pipe:0",
-                    *track_input,
-                    "-map", "0:v:0", "-map", "1:a?", "-map", "1:s?", "-map", "1:t?",
+                    # Open the source twice. Sparse subtitle tracks keep their input reading far ahead, and
+                    # audio from that same input was written minutes before its video, which stalls VLC.
+                    *track_input, *track_input,
+                    "-map", "0:v:0", "-map", "1:a?", "-map", "2:s?", "-map", "2:t?",
                     "-map_metadata", "1", "-map_chapters", "-1" if self.sample else "1",
                     "-c:a", "copy", "-c:s", "copy", "-c:t", "copy", "-c:v", "hevc_nvenc", "-profile:v", "main10", "-pix_fmt", "p010le",
                     "-preset", "p5", "-tune", "hq", "-multipass", "disabled", "-spatial-aq", "1", "-temporal-aq", "1",
