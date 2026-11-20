@@ -5,7 +5,7 @@ from fractions import Fraction
 
 import vapoursynth as vs
 
-from render import protect_lite_frames
+from render import PLUGINS, fast_model, protect_lite_frames
 
 
 def pixels(clip, index):
@@ -42,6 +42,27 @@ class LiteFrameProtectionTests(unittest.TestCase):
             self.assertEqual(pixels(protected, 2), pixels(original, 0))
             self.assertEqual(pixels(protected, 4), pixels(original, 1))
             self.assertEqual(pixels(protected, 5), pixels(candidate, 5))
+
+
+@unittest.skipUnless((PLUGINS / "models/rife_v2/rife_v4.25.onnx").is_file(), "Run Set Up RIFE.cmd first.")
+class FastModelTests(unittest.TestCase):
+    def test_writes_a_valid_model_for_each_input_layout(self):
+        import onnx
+
+        for times, channels in ((None, (7, 3)), ([0.25, 0.5, 0.75], (6, 9))):
+            path = fast_model(PLUGINS / "models/rife_v2/rife_v4.25.onnx", 256, 128, 2, times)
+            try:
+                onnx.checker.check_model(str(path))
+                graph = onnx.load(path).graph
+                shape = lambda value: value.type.tensor_type.shape.dim[1].dim_value
+                self.assertEqual((shape(graph.input[0]), shape(graph.output[0])), channels)
+                self.assertNotIn("/GridSample_4", [node.name for node in graph.node])  # small-picture warp removed
+            finally:
+                path.unlink()
+
+    def test_rejects_sizes_the_small_picture_cannot_cover(self):
+        with self.assertRaises(ValueError):
+            fast_model(PLUGINS / "models/rife_v2/rife_v4.25.onnx", 255, 128, 2)
 
 
 if __name__ == "__main__":

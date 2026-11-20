@@ -295,8 +295,8 @@ class Preview:
 class Export:
     def __init__(self, source, output, video, source_rate, target, duration, bitrate, sample, events,
                  resolution="Source", denoise=0, bm3d=0, deblock=0, parallel=1, labels=None,
-                 encoder=("p5", "disabled"), lite_model=False):
-        self.lite_model = lite_model
+                 encoder=("p5", "disabled"), lite_model=False, fast=0):
+        self.lite_model, self.fast = lite_model, fast
         self.denoise, self.bm3d, self.deblock, self.parallel = denoise, bm3d, deblock, parallel
         self.preset, self.multipass = encoder
         self.labels = dict(labels or {}, when=time.strftime("%Y-%m-%d %H:%M"),
@@ -397,7 +397,7 @@ class Export:
                 matrix=matrix, range="full" if full else "limited",
                 chroma=chroma_map.get(chroma, chroma), size=self.size,
                 dovi_map=self.video.get("dovi_map", False), denoise=self.denoise,
-                bm3d=self.bm3d, deblock=self.deblock, parallel=self.parallel, lite_model=self.lite_model,
+                bm3d=self.bm3d, deblock=self.deblock, parallel=self.parallel, lite_model=self.lite_model, fast=self.fast,
             )
             self.config.write_text(json.dumps(job), encoding="utf-8")
             input_tags = []
@@ -579,7 +579,7 @@ class App(tk.Tk):
         self.resolution_option = ttk.Combobox(table, textvariable=self.resolution, values=tuple(RESOLUTIONS),
                                               state="readonly", width=14)
         self.fps_option = ttk.Combobox(table, textvariable=self.rate, values=FRAME_RATES, width=14)
-        self.model_option = ttk.Combobox(table, textvariable=self.model, values=("Standard", "Lite"),
+        self.model_option = ttk.Combobox(table, textvariable=self.model, values=("Standard", "Lite", "Fast"),
                                          state="readonly", width=14)
         self.bitrate_entry = ttk.Entry(table, textvariable=self.bitrate, width=17)
         self.grain_option = ttk.Combobox(table, textvariable=self.grain, values=tuple(GRAIN), width=14)
@@ -593,7 +593,9 @@ class App(tk.Tk):
             ("Resolution", self.resolution_option,
              "Output size. Source keeps the original size; the others only scale down."),
             ("RIFE model", self.model_option,
-             "Lite runs faster at the selected resolution. Compare a sample for differences around moving edges."),
+             "Fast finds motion on a half-size picture and moves the full-size pixels, as televisions do. About "
+             "twice the speed of Standard at 4K; best at 1080p and above. Lite is a smaller model at full size. "
+             "Compare a sample for differences around moving edges."),
             ("Frame multiplier", self.fps_option,
              "How many times the frame rate is multiplied. Type any number above 1, up to 32 (2.5 turns 24 fps "
              "into 60), or pick 60 fps. Whole numbers keep every original frame; other values regenerate most "
@@ -728,7 +730,8 @@ class App(tk.Tk):
     def export(self, sample):
         try:
             bitrate, target = self.get_bitrate(), self.target()
-            lite_model = self.model.get() == "Lite"
+            model = self.model.get()
+            lite_model = model == "Lite"
             if lite_model and not (RUNTIME / "plugins/models/rife_v2/rife_v4.25_lite.onnx").is_file():
                 raise ValueError("Run Set Up RIFE.cmd to install the Lite model.")
             if target <= self.source_rate:
@@ -771,9 +774,10 @@ class App(tk.Tk):
                           self.duration, bitrate, sample, self.events, resolution=resolution,
                           deblock=deblock, denoise=h if fast else 0, bm3d=0 if fast else sigma,
                           parallel=parallel, encoder=ENCODERS[self.encoder_quality.get()], lite_model=lite_model,
+                          fast=2 if model == "Fast" else 0,
                           labels=dict(
                               gpu=self.gpu, output=f"{width}x{height}", parallel=f"{parallel:g}",
-                              multiplier=f"{float(target / self.source_rate):.3g}x" + (" Lite" if lite_model else ""),
+                              multiplier=f"{float(target / self.source_rate):.3g}x" + ("" if model == "Standard" else f" {model}"),
                               cleanup=" + ".join(cleanup) or "none"))
         self.percent.set(0)
         self.set_busy(True)

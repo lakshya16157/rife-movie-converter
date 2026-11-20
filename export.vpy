@@ -7,11 +7,11 @@ from pathlib import Path
 import vapoursynth as vs
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from render import frames
+from render import frames, lookahead
 
 job = json.loads(Path(os.environ["RIFE_JOB"]).read_text(encoding="utf-8"))
 clip = frames(job)
-depth = max(2, round(8 * job.get("parallel", 1)))
+depth = lookahead(job)
 pending = {}
 
 
